@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blueos-rtk-basestation"
+version = "1.0.0"
+description = "BlueOS extension that streams RTCM3 from a ZED-F9P base station to an NTRIP caster"
+dependencies = [
+    "litestar[standard]",
+    "pydantic",
+    "pyserial",
+    "uvicorn",
+]
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.package-data]
+"*" = ["static/*", "static/**/*"]
+
+[tool.setuptools.packages.find]
+exclude = ["config*", "logs*", "build*", ".venv*", "*.egg-info*"]

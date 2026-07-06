@@ -1,0 +1,9 @@
+.venv
+venv
+*.swp
+*.egg-info
+**/build
+**/__pycache__
+**/logs
+app/config/rtk_config.json
+.DS_Store

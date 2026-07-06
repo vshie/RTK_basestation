@@ -1,0 +1,9 @@
+{
+    "name": "RTK Base Station",
+    "description": "Streams RTCM3 corrections from a u-blox ZED-F9P base station to an NTRIP caster (e.g. RTK2Go).",
+    "icon": "mdi-broadcast",
+    "company": "RTK Base Station",
+    "version": "1.0.0",
+    "webpage": "https://github.com/OWNER/RTK_basestation",
+    "api": ""
+}

@@ -1,0 +1,4 @@
+litestar[standard]
+pydantic
+pyserial
+uvicorn
