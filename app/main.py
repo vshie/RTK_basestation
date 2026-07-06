@@ -43,9 +43,9 @@ _global_config = {
 # Models
 # --------------------------------------------------------------------------- #
 class RTKConfig(BaseModel):
-    caster_host: str = "rtk2go.com"
-    caster_port: int = 2101
-    mountpoint: str = "KonaHIpalisades"
+    caster_host: str = ""
+    caster_port: int = 2101  # standard NTRIP port; generic default, not a credential
+    mountpoint: str = ""
     # RTK2Go / SNIP calls this the "mount point password". Username is normally
     # unused for NTRIP v1 source pushes, but is kept for NTRIP v2 auth.
     username: str = ""

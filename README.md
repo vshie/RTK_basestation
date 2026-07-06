@@ -52,8 +52,12 @@ Open the extension from the BlueOS sidebar and fill in:
 | Serial baud | `115200` (ignored by USB CDC, kept for completeness) |
 | Enable streaming | Starts immediately and on every boot |
 
-Credentials are **not** baked into the image — you enter them in the UI and they
-are stored on the device in `config/rtk_config.json`.
+All NTRIP fields (host, mountpoint, password) default to **blank** — nothing is
+baked into the image. Whatever you enter in the UI is saved to
+`config/rtk_config.json`, which is bind-mounted to
+`/usr/blueos/extensions/rtk-basestation/config` on the host, so your settings
+**persist across reboots and container restarts**. The only non-blank defaults
+are the standard NTRIP port (`2101`) and the u-blox serial-device path.
 
 ### RTK2Go notes
 
