@@ -1,4 +1,4 @@
-litestar[standard]
+litestar
 pydantic
 pyserial
 uvicorn

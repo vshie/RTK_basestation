@@ -6,8 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "blueos-rtk-basestation"
 version = "1.0.0"
 description = "BlueOS extension that streams RTCM3 from a ZED-F9P base station to an NTRIP caster"
+# Note: avoid the [standard] extras — they pull uvloop/httptools, which have no
+# armv7 piwheels and fail to compile in the slim image (no C toolchain).
 dependencies = [
-    "litestar[standard]",
+    "litestar",
     "pydantic",
     "pyserial",
     "uvicorn",
