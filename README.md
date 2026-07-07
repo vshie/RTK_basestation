@@ -99,12 +99,35 @@ point at `github.com/vshie/RTK_basestation`.
 
 Use the Extensions Manager → **Installed** → add a manual/development install:
 
-- **Extension Identifier**: `dockerusername.rtk-basestation`
+- **Extension Identifier**: `vshie.rtk-basestation`
 - **Extension Name**: `RTK Base Station`
-- **Docker image**: `dockerusername/blueos-rtk-basestation`
-- **Docker tag**: `master` (or a released version tag)
-- **Custom settings**: the contents of the `permissions` label from the `Dockerfile`
-  (JSON, with the backslash line-continuations removed).
+- **Docker image**: `vshie/blueos-rtk-basestation`
+- **Docker tag**: `main` (or a released version tag)
+- **Custom settings**: paste the JSON below (this is the `Dockerfile`
+  `permissions` label with the line-continuations removed).
+
+```json
+{
+  "ExposedPorts": {
+    "8000/tcp": {}
+  },
+  "HostConfig": {
+    "Privileged": true,
+    "Binds": [
+      "/usr/blueos/extensions/rtk-basestation/config:/app/config",
+      "/dev:/dev"
+    ],
+    "ExtraHosts": ["host.docker.internal:host-gateway"],
+    "PortBindings": {
+      "8000/tcp": [
+        {
+          "HostPort": ""
+        }
+      ]
+    }
+  }
+}
+```
 
 ## Requirements
 
