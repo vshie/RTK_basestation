@@ -68,6 +68,15 @@ class RTKStatus(BaseModel):
     connected_since: Optional[str] = None
     message_counts: Dict[str, int] = {}
     base_position: Optional[Dict[str, float]] = None  # {lat, lon, height, x, y, z}
+    survey_in: Optional[Dict[str, Any]] = None  # {active, valid, duration_s, mean_acc_m, observations}
+    survey_message: Optional[str] = None
+
+
+class SurveyInRequest(BaseModel):
+    serial_device: str = DEFAULT_SERIAL_DEVICE
+    serial_baud: int = 115200
+    min_duration: int = 60  # seconds
+    accuracy: float = 2.0   # metres
 
 
 # --------------------------------------------------------------------------- #
@@ -221,6 +230,86 @@ def ecef_to_llh(x: float, y: float, z: float) -> tuple:
     return math.degrees(lat), math.degrees(lon), height
 
 
+# --------------------------------------------------------------------------- #
+# UBX helpers (u-blox configuration + monitoring)
+# --------------------------------------------------------------------------- #
+# Configuration-item key IDs (verified against the ZED-F9P interface description).
+CFG_TMODE_MODE = 0x20030001          # E1: 0=disabled, 1=survey-in, 2=fixed
+CFG_TMODE_SVIN_MIN_DUR = 0x40030010  # U4: seconds
+CFG_TMODE_SVIN_ACC_LIMIT = 0x40030011  # U4: 0.1 mm units
+CFG_MSGOUT_UBX_NAV_SVIN_USB = 0x2091008B  # U1: output rate on USB
+
+
+def ubx_frame(cls_id: int, msg_id: int, payload: bytes) -> bytes:
+    length = len(payload)
+    body = bytes([cls_id, msg_id, length & 0xFF, (length >> 8) & 0xFF]) + payload
+    ck_a = ck_b = 0
+    for b in body:
+        ck_a = (ck_a + b) & 0xFF
+        ck_b = (ck_b + ck_a) & 0xFF
+    return b"\xB5\x62" + body + bytes([ck_a, ck_b])
+
+
+def ubx_valset(items, layers: int = 0x07) -> bytes:
+    """Build a UBX-CFG-VALSET. items = list of (key, value, size_bytes).
+
+    layers bitmask: RAM=0x01, BBR=0x02, Flash=0x04 (0x07 = all/persistent).
+    """
+    payload = bytes([0x00, layers & 0xFF, 0x00, 0x00])
+    for key, value, size in items:
+        payload += key.to_bytes(4, "little")
+        payload += int(value).to_bytes(size, "little")
+    return ubx_frame(0x06, 0x8A, payload)
+
+
+def build_survey_in_valset(min_duration: int, accuracy_m: float, layers: int = 0x07) -> bytes:
+    """Configure survey-in mode and enable NAV-SVIN status output on USB."""
+    acc_limit = max(1, int(round(accuracy_m * 10000)))  # metres -> 0.1 mm
+    items = [
+        (CFG_TMODE_MODE, 1, 1),
+        (CFG_TMODE_SVIN_MIN_DUR, max(1, int(min_duration)), 4),
+        (CFG_TMODE_SVIN_ACC_LIMIT, acc_limit, 4),
+        (CFG_MSGOUT_UBX_NAV_SVIN_USB, 1, 1),
+    ]
+    return ubx_valset(items, layers)
+
+
+class UBXScanner:
+    """Extract complete, checksum-valid UBX frames from a byte stream."""
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+
+    def add_data(self, data: bytes):
+        self.buffer.extend(data)
+        out = []
+        while True:
+            idx = self.buffer.find(b"\xB5\x62")
+            if idx == -1:
+                if len(self.buffer) > 4096:
+                    self.buffer = self.buffer[-2:]
+                break
+            if idx > 0:
+                del self.buffer[:idx]
+            if len(self.buffer) < 6:
+                break
+            length = self.buffer[4] | (self.buffer[5] << 8)
+            total = 6 + length + 2
+            if len(self.buffer) < total:
+                break
+            frame = bytes(self.buffer[:total])
+            ck_a = ck_b = 0
+            for b in frame[2 : total - 2]:
+                ck_a = (ck_a + b) & 0xFF
+                ck_b = (ck_b + ck_a) & 0xFF
+            if ck_a == frame[total - 2] and ck_b == frame[total - 1]:
+                out.append((frame[2], frame[3], frame[6 : total - 2]))
+                del self.buffer[:total]
+            else:
+                del self.buffer[0]
+        return out
+
+
 def find_serial_device(preferred: str) -> Optional[str]:
     """Return the preferred serial device if present, else auto-detect a u-blox."""
     if preferred and os.path.exists(preferred):
@@ -249,6 +338,8 @@ class RTKController(Controller):
         self._config = self._config_manager.load_config()
         self._status = RTKStatus()
         self._task: Optional[asyncio.Task] = None
+        self._serial: Optional[serial.Serial] = None  # active handle while streaming
+        self._ubx = UBXScanner()
 
     # ---- validation -------------------------------------------------------- #
     def _validate(self, cfg: RTKConfig) -> List[str]:
@@ -314,6 +405,91 @@ class RTKController(Controller):
     @get("/status", sync_to_thread=False)
     def get_status(self) -> Dict[str, Any]:
         return self._status.model_dump()
+
+    def _apply_ubx(self, cls_id: int, msg_id: int, payload: bytes) -> None:
+        """Update status from monitored UBX messages (NAV-SVIN, ACK/NAK)."""
+        if cls_id == 0x01 and msg_id == 0x3B and len(payload) >= 40:  # UBX-NAV-SVIN
+            self._status.survey_in = {
+                "active": bool(payload[37]),
+                "valid": bool(payload[36]),
+                "duration_s": int.from_bytes(payload[8:12], "little"),
+                "mean_acc_m": round(int.from_bytes(payload[28:32], "little") / 10000.0, 4),
+                "observations": int.from_bytes(payload[32:36], "little"),
+            }
+        elif cls_id == 0x05 and msg_id in (0x00, 0x01) and len(payload) >= 2:  # ACK/NAK
+            if payload[0] == 0x06 and payload[1] == 0x8A:  # to a CFG-VALSET
+                self._status.survey_message = (
+                    "Survey-in command acknowledged"
+                    if msg_id == 0x01
+                    else "Survey-in command rejected (NAK)"
+                )
+
+    @post("/survey_in")
+    async def survey_in(self, data: SurveyInRequest) -> Dict[str, Any]:
+        """Command the ZED-F9P to (re)start a survey-in over the serial port."""
+        device = find_serial_device(data.serial_device)
+        if not device:
+            return {"success": False, "message": f"Serial device not found: {data.serial_device}"}
+
+        cmd = build_survey_in_valset(data.min_duration, data.accuracy)
+        self._status.survey_message = None
+        self._status.survey_in = None
+
+        # If the stream owns the port, write through the live handle and let the
+        # stream's UBX scanner pick up the ACK / NAV-SVIN progress.
+        if self._serial is not None and getattr(self._serial, "is_open", False):
+            try:
+                await asyncio.to_thread(self._serial.write, cmd)
+            except Exception as e:  # noqa: BLE001
+                return {"success": False, "message": f"Serial write failed: {e}"}
+            return {
+                "success": True,
+                "message": (
+                    f"Survey-in started (min {data.min_duration}s, {data.accuracy} m accuracy). "
+                    "Progress will appear in status while streaming."
+                ),
+                "device": device,
+            }
+
+        # Otherwise open our own handle, send, and read the ACK + first NAV-SVIN.
+        def _run():
+            try:
+                with serial.Serial(device, data.serial_baud, timeout=1) as ser:
+                    ser.write(cmd)
+                    ser.flush()
+                    scanner = UBXScanner()
+                    acked: Optional[bool] = None
+                    end = time.time() + 4
+                    while time.time() < end:
+                        chunk = ser.read(4096)
+                        if not chunk:
+                            continue
+                        for c, i, pl in scanner.add_data(chunk):
+                            self._apply_ubx(c, i, pl)
+                            if c == 0x05 and i in (0x00, 0x01) and len(pl) >= 2 \
+                                    and pl[0] == 0x06 and pl[1] == 0x8A:
+                                acked = i == 0x01
+                        if acked is not None and self._status.survey_in is not None:
+                            break
+                    return acked
+            except Exception as e:  # noqa: BLE001
+                return e
+
+        res = await asyncio.to_thread(_run)
+        if isinstance(res, Exception):
+            return {"success": False, "message": f"Serial error: {res}", "device": device}
+        if res is True:
+            msg = f"Survey-in started (min {data.min_duration}s, {data.accuracy} m) and acknowledged."
+        elif res is False:
+            msg = "Receiver rejected the survey-in command (NAK)."
+        else:
+            msg = "Survey-in command sent (no ACK observed; check status)."
+        return {
+            "success": res is not False,
+            "message": msg,
+            "device": device,
+            "survey_in": self._status.survey_in,
+        }
 
     @post("/test_serial")
     async def test_serial(self, data: RTKConfig) -> Dict[str, Any]:
@@ -453,6 +629,7 @@ class RTKController(Controller):
 
         loop = asyncio.get_running_loop()
         ser = await asyncio.to_thread(serial.Serial, device, cfg.serial_baud, timeout=0.5)
+        self._serial = ser
         self._status.serial_connected = True
         print(f"Opened serial device {device} @ {cfg.serial_baud}")
 
@@ -480,9 +657,12 @@ class RTKController(Controller):
             print(f"Caster connected ({text}); streaming RTCM from base station")
 
             parser = RTCMParser()
+            self._ubx = UBXScanner()
             while True:
                 chunk = await loop.run_in_executor(None, ser.read, 4096)
                 if chunk:
+                    for c, i, pl in self._ubx.add_data(chunk):
+                        self._apply_ubx(c, i, pl)
                     for msg in parser.add_data(chunk):
                         writer.write(msg)
                         self._status.bytes_pushed += len(msg)
@@ -506,6 +686,7 @@ class RTKController(Controller):
                 except asyncio.TimeoutError:
                     pass
         finally:
+            self._serial = None
             self._status.serial_connected = False
             self._status.caster_connected = False
             try:

@@ -76,8 +76,32 @@
                     <div>Last update</div><div id="s-update">-</div>
                     <div>Message types</div><div id="s-types">-</div>
                     <div>Base position</div><div id="s-pos">Unknown</div>
+                    <div>Survey-in</div><div id="s-svin">Unknown</div>
                     <div>Last error</div><div id="s-error">None</div>
                 </div>
+            </div>
+
+            <div class="section">
+                <h2>Base station survey-in</h2>
+                <p class="help-text" style="margin-top:0;">
+                    Commands the ZED-F9P to estimate its own position from a clear-sky view.
+                    Use this if the receiver was previously surveyed without a good sky view.
+                    Survey-in ends when both the minimum duration and accuracy limit are met.
+                </p>
+                <div class="grid">
+                    <div class="form-group">
+                        <label for="svin_dur">Minimum duration (seconds)</label>
+                        <input id="svin_dur" type="number" value="60" min="1">
+                    </div>
+                    <div class="form-group">
+                        <label for="svin_acc">Accuracy limit (metres)</label>
+                        <input id="svin_acc" type="number" value="2.0" min="0.1" step="0.1">
+                    </div>
+                </div>
+                <div class="btn-row">
+                    <button type="button" id="btn-svin">Start survey-in</button>
+                </div>
+                <div id="svin-msg" class="msg"></div>
             </div>
 
             <div class="section">
@@ -94,7 +118,7 @@
                         </div>
                         <div class="form-group">
                             <label for="mountpoint">Mountpoint</label>
-                            <input id="mountpoint" name="mountpoint" type="text" placeholder="KonaHIpalisades" required>
+                            <input id="mountpoint" name="mountpoint" type="text" placeholder="your-mountpoint" required>
                             <div class="help-text">Case sensitive. Must match your RTK2Go reservation.</div>
                         </div>
                         <div class="form-group">
@@ -212,6 +236,14 @@
             } else {
                 $('s-pos').textContent = 'Unknown';
             }
+            if (s.survey_in) {
+                const v = s.survey_in;
+                const state = v.valid ? 'valid (complete)' : (v.active ? 'in progress' : 'inactive');
+                $('s-svin').textContent =
+                    `${state} — ${v.duration_s}s, acc ${v.mean_acc_m} m, ${v.observations} obs`;
+            } else {
+                $('s-svin').textContent = s.survey_message || 'Unknown';
+            }
             $('s-error').textContent = s.last_error || 'None';
         }
 
@@ -257,6 +289,32 @@
                 const d = await r.json();
                 showMsg(d.message, d.success ? 'ok' : 'bad');
             } catch (err) { showMsg('Caster test failed: ' + err, 'bad'); }
+        });
+
+        $('btn-svin').addEventListener('click', async () => {
+            const cfg = collect();
+            const body = {
+                serial_device: cfg.serial_device,
+                serial_baud: cfg.serial_baud,
+                min_duration: parseInt($('svin_dur').value || '60', 10),
+                accuracy: parseFloat($('svin_acc').value || '2.0'),
+            };
+            const el = $('svin-msg');
+            el.className = 'msg info';
+            el.textContent = 'Sending survey-in command to the receiver...';
+            try {
+                const r = await fetch('survey_in', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const d = await r.json();
+                el.className = 'msg ' + (d.success ? 'ok' : 'bad');
+                el.textContent = d.message;
+            } catch (err) {
+                el.className = 'msg bad';
+                el.textContent = 'Survey-in request failed: ' + err;
+            }
         });
 
         loadConfig();
