@@ -50,9 +50,9 @@ LABEL tags='[\
     "navigation",\
     "data-collection"\
 ]'
-LABEL readme='https://raw.githubusercontent.com/OWNER/RTK_basestation/{tag}/README.md'
+LABEL readme='https://raw.githubusercontent.com/vshie/RTK_basestation/{tag}/README.md'
 LABEL links='{\
-        "source": "https://github.com/OWNER/RTK_basestation"\
+        "source": "https://github.com/vshie/RTK_basestation"\
     }'
 LABEL requirements="core >= 1.1"
 

@@ -92,8 +92,8 @@ Configure the repository:
 - `MY_NAME`, `MY_EMAIL` — author details
 - `ORG_NAME`, `ORG_EMAIL` — maintainer details
 
-Also replace the `OWNER` placeholders in `Dockerfile` (`readme` / `links` labels)
-and `app/static/register_service` with your GitHub username/repo.
+The `Dockerfile` (`readme` / `links` labels) and `app/static/register_service`
+point at `github.com/vshie/RTK_basestation`.
 
 ## Installing on BlueOS
 
