@@ -20,6 +20,7 @@ LABEL permissions='\
       "/usr/blueos/extensions/rtk-basestation/config:/app/config",\
       "/dev:/dev"\
     ],\
+    "Dns": ["8.8.8.8", "1.1.1.1"],\
     "ExtraHosts": ["host.docker.internal:host-gateway"],\
     "PortBindings": {\
       "8000/tcp": [\

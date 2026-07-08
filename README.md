@@ -117,6 +117,7 @@ Use the Extensions Manager → **Installed** → add a manual/development instal
       "/usr/blueos/extensions/rtk-basestation/config:/app/config",
       "/dev:/dev"
     ],
+    "Dns": ["8.8.8.8", "1.1.1.1"],
     "ExtraHosts": ["host.docker.internal:host-gateway"],
     "PortBindings": {
       "8000/tcp": [
