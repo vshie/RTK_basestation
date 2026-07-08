@@ -68,6 +68,9 @@ class RTKStatus(BaseModel):
     connected_since: Optional[str] = None
     message_counts: Dict[str, int] = {}
     base_position: Optional[Dict[str, float]] = None  # {lat, lon, height, x, y, z}
+    satellites: Optional[int] = None  # satellites used in the solution (from NMEA GGA)
+    hdop: Optional[float] = None  # horizontal dilution of precision (from NMEA GGA)
+    fix_quality: Optional[int] = None  # NMEA GGA quality (0=none, 1=GPS, 2=DGPS, ...)
     survey_in: Optional[Dict[str, Any]] = None  # {active, valid, duration_s, mean_acc_m, observations}
     survey_message: Optional[str] = None
 
@@ -310,6 +313,87 @@ class UBXScanner:
         return out
 
 
+class NMEAScanner:
+    """Extract NMEA sentences and pull sats / HDOP from GGA (and HDOP from GSA)."""
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+
+    def add_data(self, data: bytes) -> List[Dict[str, Any]]:
+        self.buffer.extend(data)
+        updates: List[Dict[str, Any]] = []
+        while True:
+            start = self.buffer.find(b"$")
+            if start == -1:
+                if len(self.buffer) > 4096:
+                    self.buffer.clear()
+                break
+            if start > 0:
+                del self.buffer[:start]
+            end = self.buffer.find(b"\n")
+            if end == -1:
+                if len(self.buffer) > 512:
+                    # Incomplete / garbage line — drop the leading '$' and resync.
+                    del self.buffer[0]
+                break
+            line = bytes(self.buffer[: end + 1])
+            del self.buffer[: end + 1]
+            parsed = _parse_nmea_line(line)
+            if parsed:
+                updates.append(parsed)
+        return updates
+
+
+def _nmea_checksum_ok(sentence: bytes) -> bool:
+    """Validate NMEA XOR checksum for a full sentence including $...*CS\\r\\n."""
+    try:
+        text = sentence.decode("ascii", errors="ignore").strip()
+        if not text.startswith("$") or "*" not in text:
+            return False
+        body, cs = text[1:].rsplit("*", 1)
+        if len(cs) < 2:
+            return False
+        expected = int(cs[:2], 16)
+        actual = 0
+        for ch in body:
+            actual ^= ord(ch)
+        return actual == expected
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _parse_nmea_line(line: bytes) -> Optional[Dict[str, Any]]:
+    """Parse GGA (sats + HDOP + quality) or GSA (HDOP) into a status update dict."""
+    if not _nmea_checksum_ok(line):
+        return None
+    text = line.decode("ascii", errors="ignore").strip()
+    body = text[1:].split("*", 1)[0]
+    fields = body.split(",")
+    if not fields:
+        return None
+    talker = fields[0]  # e.g. GNGGA / GPGGA / GNGSA
+    if talker.endswith("GGA") and len(fields) >= 9:
+        out: Dict[str, Any] = {}
+        try:
+            if fields[6]:
+                out["fix_quality"] = int(fields[6])
+            if fields[7]:
+                out["satellites"] = int(fields[7])
+            if fields[8]:
+                out["hdop"] = float(fields[8])
+        except ValueError:
+            return None
+        return out or None
+    if talker.endswith("GSA") and len(fields) >= 17:
+        # GSA: HDOP is field 16 (0-based index 15) after the satellite PRN list.
+        try:
+            if fields[16]:
+                return {"hdop": float(fields[16])}
+        except (ValueError, IndexError):
+            return None
+    return None
+
+
 def find_serial_device(preferred: str) -> Optional[str]:
     """Return the preferred serial device if present, else auto-detect a u-blox."""
     if preferred and os.path.exists(preferred):
@@ -340,6 +424,7 @@ class RTKController(Controller):
         self._task: Optional[asyncio.Task] = None
         self._serial: Optional[serial.Serial] = None  # active handle while streaming
         self._ubx = UBXScanner()
+        self._nmea = NMEAScanner()
 
     # ---- validation -------------------------------------------------------- #
     def _validate(self, cfg: RTKConfig) -> List[str]:
@@ -424,6 +509,15 @@ class RTKController(Controller):
                     else "Survey-in command rejected (NAK)"
                 )
 
+    def _apply_nmea(self, update: Dict[str, Any]) -> None:
+        """Update sats / HDOP / fix quality from a parsed NMEA sentence."""
+        if "satellites" in update:
+            self._status.satellites = update["satellites"]
+        if "hdop" in update:
+            self._status.hdop = update["hdop"]
+        if "fix_quality" in update:
+            self._status.fix_quality = update["fix_quality"]
+
     @post("/survey_in")
     async def survey_in(self, data: SurveyInRequest) -> Dict[str, Any]:
         """Command the ZED-F9P to (re)start a survey-in over the serial port."""
@@ -500,9 +594,13 @@ class RTKController(Controller):
 
         def _probe() -> Dict[str, Any]:
             parser = RTCMParser()
+            nmea = NMEAScanner()
             counts: Dict[str, int] = {}
             base_pos = None
             total = 0
+            satellites = None
+            hdop = None
+            fix_quality = None
             try:
                 with serial.Serial(device, data.serial_baud, timeout=1) as ser:
                     end = time.time() + 6
@@ -510,6 +608,13 @@ class RTKController(Controller):
                         chunk = ser.read(4096)
                         if not chunk:
                             continue
+                        for update in nmea.add_data(chunk):
+                            if "satellites" in update:
+                                satellites = update["satellites"]
+                            if "hdop" in update:
+                                hdop = update["hdop"]
+                            if "fix_quality" in update:
+                                fix_quality = update["fix_quality"]
                         for msg in parser.add_data(chunk):
                             total += 1
                             mt = rtcm_message_type(msg)
@@ -518,14 +623,23 @@ class RTKController(Controller):
                                 base_pos = decode_1005(msg)
             except Exception as e:  # noqa: BLE001
                 return {"success": False, "message": f"Serial error: {e}", "device": device}
+            extras = []
+            if satellites is not None:
+                extras.append(f"{satellites} sats")
+            if hdop is not None:
+                extras.append(f"HDOP {hdop}")
+            extra_txt = f" | {', '.join(extras)}" if extras else ""
             return {
                 "success": total > 0,
                 "device": device,
                 "rtcm_messages": total,
                 "message_counts": counts,
                 "base_position": base_pos,
+                "satellites": satellites,
+                "hdop": hdop,
+                "fix_quality": fix_quality,
                 "message": (
-                    f"Received {total} RTCM messages ({', '.join(sorted(counts)) or 'none'})"
+                    f"Received {total} RTCM messages ({', '.join(sorted(counts)) or 'none'}){extra_txt}"
                     if total
                     else "No RTCM messages received - is the F9P in base mode?"
                 ),
@@ -658,11 +772,14 @@ class RTKController(Controller):
 
             parser = RTCMParser()
             self._ubx = UBXScanner()
+            self._nmea = NMEAScanner()
             while True:
                 chunk = await loop.run_in_executor(None, ser.read, 4096)
                 if chunk:
                     for c, i, pl in self._ubx.add_data(chunk):
                         self._apply_ubx(c, i, pl)
+                    for update in self._nmea.add_data(chunk):
+                        self._apply_nmea(update)
                     for msg in parser.add_data(chunk):
                         writer.write(msg)
                         self._status.bytes_pushed += len(msg)

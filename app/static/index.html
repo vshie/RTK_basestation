@@ -76,6 +76,8 @@
                     <div>Last update</div><div id="s-update">-</div>
                     <div>Message types</div><div id="s-types">-</div>
                     <div>Base position</div><div id="s-pos">Unknown</div>
+                    <div>Satellites</div><div id="s-sats">Unknown</div>
+                    <div>HDOP</div><div id="s-hdop">Unknown</div>
                     <div>Survey-in</div><div id="s-svin">Unknown</div>
                     <div>Last error</div><div id="s-error">None</div>
                 </div>
@@ -236,6 +238,14 @@
             } else {
                 $('s-pos').textContent = 'Unknown';
             }
+            if (s.satellites != null) {
+                const q = s.fix_quality;
+                const qLabel = ({0:'no fix',1:'GPS',2:'DGPS',4:'RTK fixed',5:'RTK float'}[q] || (q != null ? `q${q}` : ''));
+                $('s-sats').textContent = qLabel ? `${s.satellites} (${qLabel})` : String(s.satellites);
+            } else {
+                $('s-sats').textContent = 'Unknown';
+            }
+            $('s-hdop').textContent = (s.hdop != null) ? Number(s.hdop).toFixed(2) : 'Unknown';
             if (s.survey_in) {
                 const v = s.survey_in;
                 const state = v.valid ? 'valid (complete)' : (v.active ? 'in progress' : 'inactive');
