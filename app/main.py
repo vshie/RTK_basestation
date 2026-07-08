@@ -67,12 +67,14 @@ class RTKStatus(BaseModel):
     rtcm_messages_pushed: int = 0
     connected_since: Optional[str] = None
     message_counts: Dict[str, int] = {}
-    base_position: Optional[Dict[str, float]] = None  # {lat, lon, height, x, y, z}
+    base_position: Optional[Dict[str, float]] = None  # ARP from RTCM 1005/1006 {lat, lon, height, x, y, z}
+    gps_position: Optional[Dict[str, float]] = None  # live NMEA GGA {lat, lon, alt}
     satellites: Optional[int] = None  # satellites used in the solution (from NMEA GGA)
     hdop: Optional[float] = None  # horizontal dilution of precision (from NMEA GGA)
     fix_quality: Optional[int] = None  # NMEA GGA quality (0=none, 1=GPS, 2=DGPS, ...)
     survey_in: Optional[Dict[str, Any]] = None  # {active, valid, duration_s, mean_acc_m, observations}
     survey_message: Optional[str] = None
+    tmode: Optional[str] = None  # disabled | survey-in | fixed (best-effort from last command)
 
 
 class SurveyInRequest(BaseModel):
@@ -80,6 +82,16 @@ class SurveyInRequest(BaseModel):
     serial_baud: int = 115200
     min_duration: int = 60  # seconds
     accuracy: float = 2.0   # metres
+
+
+class FixedPositionRequest(BaseModel):
+    serial_device: str = DEFAULT_SERIAL_DEVICE
+    serial_baud: int = 115200
+    # If omitted, the extension uses the current base_position (RTCM 1005) or live GGA.
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    height: Optional[float] = None  # metres (ellipsoidal / ARP height)
+    accuracy: float = 0.01  # metres — reported fixed-position accuracy
 
 
 # --------------------------------------------------------------------------- #
@@ -238,6 +250,14 @@ def ecef_to_llh(x: float, y: float, z: float) -> tuple:
 # --------------------------------------------------------------------------- #
 # Configuration-item key IDs (verified against the ZED-F9P interface description).
 CFG_TMODE_MODE = 0x20030001          # E1: 0=disabled, 1=survey-in, 2=fixed
+CFG_TMODE_POS_TYPE = 0x20030002      # E1: 0=ECEF, 1=LLH
+CFG_TMODE_LAT = 0x40030009           # I4: 1e-7 deg
+CFG_TMODE_LON = 0x4003000A           # I4: 1e-7 deg
+CFG_TMODE_HEIGHT = 0x4003000B        # I4: cm
+CFG_TMODE_LAT_HP = 0x2003002B        # I1: 1e-9 deg
+CFG_TMODE_LON_HP = 0x2003002C        # I1: 1e-9 deg
+CFG_TMODE_HEIGHT_HP = 0x2003002D     # I1: 0.1 mm
+CFG_TMODE_FIXED_POS_ACC = 0x4003000F # U4: 0.1 mm
 CFG_TMODE_SVIN_MIN_DUR = 0x40030010  # U4: seconds
 CFG_TMODE_SVIN_ACC_LIMIT = 0x40030011  # U4: 0.1 mm units
 CFG_MSGOUT_UBX_NAV_SVIN_USB = 0x2091008B  # U1: output rate on USB
@@ -257,11 +277,12 @@ def ubx_valset(items, layers: int = 0x07) -> bytes:
     """Build a UBX-CFG-VALSET. items = list of (key, value, size_bytes).
 
     layers bitmask: RAM=0x01, BBR=0x02, Flash=0x04 (0x07 = all/persistent).
+    Values may be signed; encode with two's complement via signed=True.
     """
     payload = bytes([0x00, layers & 0xFF, 0x00, 0x00])
     for key, value, size in items:
         payload += key.to_bytes(4, "little")
-        payload += int(value).to_bytes(size, "little")
+        payload += int(value).to_bytes(size, "little", signed=True)
     return ubx_frame(0x06, 0x8A, payload)
 
 
@@ -272,6 +293,45 @@ def build_survey_in_valset(min_duration: int, accuracy_m: float, layers: int = 0
         (CFG_TMODE_MODE, 1, 1),
         (CFG_TMODE_SVIN_MIN_DUR, max(1, int(min_duration)), 4),
         (CFG_TMODE_SVIN_ACC_LIMIT, acc_limit, 4),
+        (CFG_MSGOUT_UBX_NAV_SVIN_USB, 1, 1),
+    ]
+    return ubx_valset(items, layers)
+
+
+def _llh_to_tmode_fields(lat: float, lon: float, height_m: float):
+    """Encode WGS84 LLH into u-blox TMODE LAT/LON/HEIGHT (+ HP) fields."""
+    lat_scaled = lat * 1e7
+    lon_scaled = lon * 1e7
+    lat_i = int(lat_scaled)
+    lon_i = int(lon_scaled)
+    lat_hp = int(round((lat_scaled - lat_i) * 100))  # residual as 1e-9 deg
+    lon_hp = int(round((lon_scaled - lon_i) * 100))
+    # Clamp HP to signed I1 range
+    lat_hp = max(-128, min(127, lat_hp))
+    lon_hp = max(-128, min(127, lon_hp))
+
+    height_cm = int(height_m * 100)
+    height_hp = int(round((height_m * 100 - height_cm) * 10))  # 0.1 mm
+    height_hp = max(-128, min(127, height_hp))
+    return lat_i, lat_hp, lon_i, lon_hp, height_cm, height_hp
+
+
+def build_fixed_position_valset(
+    lat: float, lon: float, height_m: float, accuracy_m: float = 0.01, layers: int = 0x07
+) -> bytes:
+    """Configure fixed (stationary) timing mode at a known LLH position."""
+    lat_i, lat_hp, lon_i, lon_hp, height_cm, height_hp = _llh_to_tmode_fields(lat, lon, height_m)
+    acc = max(1, int(round(accuracy_m * 10000)))  # metres -> 0.1 mm
+    items = [
+        (CFG_TMODE_MODE, 2, 1),          # FIXED
+        (CFG_TMODE_POS_TYPE, 1, 1),      # LLH
+        (CFG_TMODE_LAT, lat_i, 4),
+        (CFG_TMODE_LON, lon_i, 4),
+        (CFG_TMODE_HEIGHT, height_cm, 4),
+        (CFG_TMODE_LAT_HP, lat_hp, 1),
+        (CFG_TMODE_LON_HP, lon_hp, 1),
+        (CFG_TMODE_HEIGHT_HP, height_hp, 1),
+        (CFG_TMODE_FIXED_POS_ACC, acc, 4),
         (CFG_MSGOUT_UBX_NAV_SVIN_USB, 1, 1),
     ]
     return ubx_valset(items, layers)
@@ -362,8 +422,24 @@ def _nmea_checksum_ok(sentence: bytes) -> bool:
         return False
 
 
+def _nmea_dm_to_deg(dm: str, hemi: str) -> Optional[float]:
+    """Convert NMEA ddmm.mmmm / dddmm.mmmm + hemisphere to decimal degrees."""
+    if not dm or not hemi:
+        return None
+    try:
+        val = float(dm)
+    except ValueError:
+        return None
+    deg = int(val // 100)
+    minutes = val - deg * 100
+    decimal = deg + minutes / 60.0
+    if hemi in ("S", "W"):
+        decimal = -decimal
+    return decimal
+
+
 def _parse_nmea_line(line: bytes) -> Optional[Dict[str, Any]]:
-    """Parse GGA (sats + HDOP + quality) or GSA (HDOP) into a status update dict."""
+    """Parse GGA (position, sats, HDOP, quality) or GSA (HDOP) into a status update."""
     if not _nmea_checksum_ok(line):
         return None
     text = line.decode("ascii", errors="ignore").strip()
@@ -372,7 +448,7 @@ def _parse_nmea_line(line: bytes) -> Optional[Dict[str, Any]]:
     if not fields:
         return None
     talker = fields[0]  # e.g. GNGGA / GPGGA / GNGSA
-    if talker.endswith("GGA") and len(fields) >= 9:
+    if talker.endswith("GGA") and len(fields) >= 10:
         out: Dict[str, Any] = {}
         try:
             if fields[6]:
@@ -381,6 +457,15 @@ def _parse_nmea_line(line: bytes) -> Optional[Dict[str, Any]]:
                 out["satellites"] = int(fields[7])
             if fields[8]:
                 out["hdop"] = float(fields[8])
+            lat = _nmea_dm_to_deg(fields[2], fields[3]) if len(fields) > 3 else None
+            lon = _nmea_dm_to_deg(fields[4], fields[5]) if len(fields) > 5 else None
+            alt = float(fields[9]) if fields[9] else None
+            if lat is not None and lon is not None:
+                out["gps_position"] = {
+                    "lat": lat,
+                    "lon": lon,
+                    "alt": alt if alt is not None else 0.0,
+                }
         except ValueError:
             return None
         return out or None
@@ -510,45 +595,28 @@ class RTKController(Controller):
                 )
 
     def _apply_nmea(self, update: Dict[str, Any]) -> None:
-        """Update sats / HDOP / fix quality from a parsed NMEA sentence."""
+        """Update sats / HDOP / fix quality / live position from a parsed NMEA sentence."""
         if "satellites" in update:
             self._status.satellites = update["satellites"]
         if "hdop" in update:
             self._status.hdop = update["hdop"]
         if "fix_quality" in update:
             self._status.fix_quality = update["fix_quality"]
+        if "gps_position" in update:
+            self._status.gps_position = update["gps_position"]
 
-    @post("/survey_in")
-    async def survey_in(self, data: SurveyInRequest) -> Dict[str, Any]:
-        """Command the ZED-F9P to (re)start a survey-in over the serial port."""
-        device = find_serial_device(data.serial_device)
-        if not device:
-            return {"success": False, "message": f"Serial device not found: {data.serial_device}"}
-
-        cmd = build_survey_in_valset(data.min_duration, data.accuracy)
-        self._status.survey_message = None
-        self._status.survey_in = None
-
-        # If the stream owns the port, write through the live handle and let the
-        # stream's UBX scanner pick up the ACK / NAV-SVIN progress.
+    async def _send_ubx_command(self, cmd: bytes, device: str, baud: int) -> Dict[str, Any]:
+        """Write a UBX command on the live stream handle or a temporary serial open."""
         if self._serial is not None and getattr(self._serial, "is_open", False):
             try:
                 await asyncio.to_thread(self._serial.write, cmd)
             except Exception as e:  # noqa: BLE001
                 return {"success": False, "message": f"Serial write failed: {e}"}
-            return {
-                "success": True,
-                "message": (
-                    f"Survey-in started (min {data.min_duration}s, {data.accuracy} m accuracy). "
-                    "Progress will appear in status while streaming."
-                ),
-                "device": device,
-            }
+            return {"success": True, "acked": None, "device": device}
 
-        # Otherwise open our own handle, send, and read the ACK + first NAV-SVIN.
         def _run():
             try:
-                with serial.Serial(device, data.serial_baud, timeout=1) as ser:
+                with serial.Serial(device, baud, timeout=1) as ser:
                     ser.write(cmd)
                     ser.flush()
                     scanner = UBXScanner()
@@ -563,7 +631,7 @@ class RTKController(Controller):
                             if c == 0x05 and i in (0x00, 0x01) and len(pl) >= 2 \
                                     and pl[0] == 0x06 and pl[1] == 0x8A:
                                 acked = i == 0x01
-                        if acked is not None and self._status.survey_in is not None:
+                        if acked is not None:
                             break
                     return acked
             except Exception as e:  # noqa: BLE001
@@ -572,17 +640,97 @@ class RTKController(Controller):
         res = await asyncio.to_thread(_run)
         if isinstance(res, Exception):
             return {"success": False, "message": f"Serial error: {res}", "device": device}
-        if res is True:
+        return {"success": res is not False, "acked": res, "device": device}
+
+    @post("/survey_in")
+    async def survey_in(self, data: SurveyInRequest) -> Dict[str, Any]:
+        """Command the ZED-F9P to (re)start a survey-in over the serial port."""
+        device = find_serial_device(data.serial_device)
+        if not device:
+            return {"success": False, "message": f"Serial device not found: {data.serial_device}"}
+
+        cmd = build_survey_in_valset(data.min_duration, data.accuracy)
+        self._status.survey_message = None
+        self._status.survey_in = None
+        result = await self._send_ubx_command(cmd, device, data.serial_baud)
+        if not result.get("success"):
+            return result
+
+        self._status.tmode = "survey-in"
+        acked = result.get("acked")
+        if acked is True:
             msg = f"Survey-in started (min {data.min_duration}s, {data.accuracy} m) and acknowledged."
-        elif res is False:
+        elif acked is False:
             msg = "Receiver rejected the survey-in command (NAK)."
+            return {"success": False, "message": msg, "device": device}
         else:
-            msg = "Survey-in command sent (no ACK observed; check status)."
+            msg = (
+                f"Survey-in started (min {data.min_duration}s, {data.accuracy} m accuracy). "
+                "Progress will appear in status while streaming."
+            )
         return {
-            "success": res is not False,
+            "success": True,
             "message": msg,
             "device": device,
             "survey_in": self._status.survey_in,
+        }
+
+    @post("/fixed_position")
+    async def fixed_position(self, data: FixedPositionRequest) -> Dict[str, Any]:
+        """Lock the ZED-F9P into fixed (stationary) timing mode at a known position.
+
+        Prefer an explicit lat/lon/height. If omitted, use the surveyed ARP from
+        RTCM 1005, else the latest live GGA position.
+        """
+        device = find_serial_device(data.serial_device)
+        if not device:
+            return {"success": False, "message": f"Serial device not found: {data.serial_device}"}
+
+        lat, lon, height = data.lat, data.lon, data.height
+        source = "provided"
+        if lat is None or lon is None or height is None:
+            if self._status.base_position:
+                lat = self._status.base_position["lat"]
+                lon = self._status.base_position["lon"]
+                height = self._status.base_position["height"]
+                source = "RTCM 1005 ARP"
+            elif self._status.gps_position:
+                lat = self._status.gps_position["lat"]
+                lon = self._status.gps_position["lon"]
+                height = self._status.gps_position["alt"]
+                source = "live GGA"
+            else:
+                return {
+                    "success": False,
+                    "message": (
+                        "No position available. Enter lat/lon/height, wait for a base "
+                        "position (RTCM 1005), or wait for a live GPS fix."
+                    ),
+                }
+
+        cmd = build_fixed_position_valset(lat, lon, height, data.accuracy)
+        result = await self._send_ubx_command(cmd, device, data.serial_baud)
+        if not result.get("success"):
+            return result
+
+        self._status.tmode = "fixed"
+        self._status.survey_message = (
+            f"Fixed position locked from {source}: {lat:.7f}, {lon:.7f}, {height:.2f} m"
+        )
+        acked = result.get("acked")
+        if acked is False:
+            return {"success": False, "message": "Receiver rejected fixed-position command (NAK).", "device": device}
+        return {
+            "success": True,
+            "message": (
+                f"Fixed (stationary) mode set from {source}: "
+                f"{lat:.7f}, {lon:.7f}, alt {height:.2f} m "
+                f"(accuracy {data.accuracy} m)."
+            ),
+            "device": device,
+            "position": {"lat": lat, "lon": lon, "height": height},
+            "source": source,
+            "tmode": "fixed",
         }
 
     @post("/test_serial")
@@ -601,6 +749,7 @@ class RTKController(Controller):
             satellites = None
             hdop = None
             fix_quality = None
+            gps_position = None
             try:
                 with serial.Serial(device, data.serial_baud, timeout=1) as ser:
                     end = time.time() + 6
@@ -615,6 +764,8 @@ class RTKController(Controller):
                                 hdop = update["hdop"]
                             if "fix_quality" in update:
                                 fix_quality = update["fix_quality"]
+                            if "gps_position" in update:
+                                gps_position = update["gps_position"]
                         for msg in parser.add_data(chunk):
                             total += 1
                             mt = rtcm_message_type(msg)
@@ -628,6 +779,10 @@ class RTKController(Controller):
                 extras.append(f"{satellites} sats")
             if hdop is not None:
                 extras.append(f"HDOP {hdop}")
+            if gps_position is not None:
+                extras.append(
+                    f"{gps_position['lat']:.6f},{gps_position['lon']:.6f} alt {gps_position['alt']:.1f}m"
+                )
             extra_txt = f" | {', '.join(extras)}" if extras else ""
             return {
                 "success": total > 0,
@@ -635,6 +790,7 @@ class RTKController(Controller):
                 "rtcm_messages": total,
                 "message_counts": counts,
                 "base_position": base_pos,
+                "gps_position": gps_position,
                 "satellites": satellites,
                 "hdop": hdop,
                 "fix_quality": fix_quality,

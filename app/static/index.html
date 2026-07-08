@@ -75,33 +75,55 @@
                     <div>Connected since</div><div id="s-since">-</div>
                     <div>Last update</div><div id="s-update">-</div>
                     <div>Message types</div><div id="s-types">-</div>
-                    <div>Base position</div><div id="s-pos">Unknown</div>
+                    <div>Base ARP (RTCM 1005)</div><div id="s-pos">Unknown</div>
+                    <div>Live GPS lat/lon</div><div id="s-gps">Unknown</div>
+                    <div>Live GPS altitude</div><div id="s-alt">Unknown</div>
                     <div>Satellites</div><div id="s-sats">Unknown</div>
                     <div>HDOP</div><div id="s-hdop">Unknown</div>
+                    <div>Timing mode</div><div id="s-tmode">Unknown</div>
                     <div>Survey-in</div><div id="s-svin">Unknown</div>
                     <div>Last error</div><div id="s-error">None</div>
                 </div>
             </div>
 
             <div class="section">
-                <h2>Base station survey-in</h2>
+                <h2>Base station position</h2>
                 <p class="help-text" style="margin-top:0;">
-                    Commands the ZED-F9P to estimate its own position from a clear-sky view.
-                    Use this if the receiver was previously surveyed without a good sky view.
-                    Survey-in ends when both the minimum duration and accuracy limit are met.
+                    For a stationary base, <strong>fixed mode</strong> is preferred: the receiver
+                    treats its antenna as immobile and broadcasts a stable ARP in RTCM 1005.
+                    Survey-in estimates that position from a clear-sky average; once valid, lock it
+                    with &ldquo;Use surveyed position as fixed&rdquo;. You can also enter known
+                    coordinates manually.
                 </p>
                 <div class="grid">
                     <div class="form-group">
-                        <label for="svin_dur">Minimum duration (seconds)</label>
+                        <label for="svin_dur">Survey-in min duration (seconds)</label>
                         <input id="svin_dur" type="number" value="60" min="1">
                     </div>
                     <div class="form-group">
-                        <label for="svin_acc">Accuracy limit (metres)</label>
+                        <label for="svin_acc">Survey-in accuracy limit (metres)</label>
                         <input id="svin_acc" type="number" value="2.0" min="0.1" step="0.1">
+                    </div>
+                    <div class="form-group">
+                        <label for="fix_lat">Fixed latitude (optional)</label>
+                        <input id="fix_lat" type="number" step="0.0000001" placeholder="from ARP / GGA if blank">
+                    </div>
+                    <div class="form-group">
+                        <label for="fix_lon">Fixed longitude (optional)</label>
+                        <input id="fix_lon" type="number" step="0.0000001" placeholder="from ARP / GGA if blank">
+                    </div>
+                    <div class="form-group">
+                        <label for="fix_height">Fixed height / altitude m (optional)</label>
+                        <input id="fix_height" type="number" step="0.01" placeholder="from ARP / GGA if blank">
+                    </div>
+                    <div class="form-group">
+                        <label for="fix_acc">Fixed position accuracy (metres)</label>
+                        <input id="fix_acc" type="number" value="0.01" min="0.001" step="0.001">
                     </div>
                 </div>
                 <div class="btn-row">
                     <button type="button" id="btn-svin">Start survey-in</button>
+                    <button type="button" class="secondary" id="btn-fixed">Lock fixed position</button>
                 </div>
                 <div id="svin-msg" class="msg"></div>
             </div>
@@ -238,6 +260,14 @@
             } else {
                 $('s-pos').textContent = 'Unknown';
             }
+            if (s.gps_position) {
+                const g = s.gps_position;
+                $('s-gps').textContent = `${g.lat.toFixed(7)}, ${g.lon.toFixed(7)}`;
+                $('s-alt').textContent = `${Number(g.alt).toFixed(2)} m`;
+            } else {
+                $('s-gps').textContent = 'Unknown';
+                $('s-alt').textContent = 'Unknown';
+            }
             if (s.satellites != null) {
                 const q = s.fix_quality;
                 const qLabel = ({0:'no fix',1:'GPS',2:'DGPS',4:'RTK fixed',5:'RTK float'}[q] || (q != null ? `q${q}` : ''));
@@ -246,6 +276,7 @@
                 $('s-sats').textContent = 'Unknown';
             }
             $('s-hdop').textContent = (s.hdop != null) ? Number(s.hdop).toFixed(2) : 'Unknown';
+            $('s-tmode').textContent = s.tmode || (s.survey_in && s.survey_in.valid ? 'fixed/surveyed' : 'Unknown');
             if (s.survey_in) {
                 const v = s.survey_in;
                 const state = v.valid ? 'valid (complete)' : (v.active ? 'in progress' : 'inactive');
@@ -324,6 +355,37 @@
             } catch (err) {
                 el.className = 'msg bad';
                 el.textContent = 'Survey-in request failed: ' + err;
+            }
+        });
+
+        $('btn-fixed').addEventListener('click', async () => {
+            const cfg = collect();
+            const latV = $('fix_lat').value.trim();
+            const lonV = $('fix_lon').value.trim();
+            const hV = $('fix_height').value.trim();
+            const body = {
+                serial_device: cfg.serial_device,
+                serial_baud: cfg.serial_baud,
+                accuracy: parseFloat($('fix_acc').value || '0.01'),
+            };
+            if (latV) body.lat = parseFloat(latV);
+            if (lonV) body.lon = parseFloat(lonV);
+            if (hV) body.height = parseFloat(hV);
+            const el = $('svin-msg');
+            el.className = 'msg info';
+            el.textContent = 'Locking fixed (stationary) position on the receiver...';
+            try {
+                const r = await fetch('fixed_position', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const d = await r.json();
+                el.className = 'msg ' + (d.success ? 'ok' : 'bad');
+                el.textContent = d.message;
+            } catch (err) {
+                el.className = 'msg bad';
+                el.textContent = 'Fixed-position request failed: ' + err;
             }
         });
 
