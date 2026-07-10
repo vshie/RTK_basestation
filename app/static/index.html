@@ -271,7 +271,10 @@
             if (s.satellites != null) {
                 const q = s.fix_quality;
                 const qLabel = ({0:'no fix',1:'GPS',2:'DGPS',4:'RTK fixed',5:'RTK float'}[q] || (q != null ? `q${q}` : ''));
-                $('s-sats').textContent = qLabel ? `${s.satellites} (${qLabel})` : String(s.satellites);
+                let txt = String(s.satellites) + ' used in nav';
+                if (s.satellites_tracked != null) txt += ` / ${s.satellites_tracked} tracked`;
+                if (qLabel) txt += ` (${qLabel})`;
+                $('s-sats').textContent = txt;
             } else {
                 $('s-sats').textContent = 'Unknown';
             }

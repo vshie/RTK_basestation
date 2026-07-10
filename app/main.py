@@ -69,7 +69,8 @@ class RTKStatus(BaseModel):
     message_counts: Dict[str, int] = {}
     base_position: Optional[Dict[str, float]] = None  # ARP from RTCM 1005/1006 {lat, lon, height, x, y, z}
     gps_position: Optional[Dict[str, float]] = None  # live NMEA GGA {lat, lon, alt}
-    satellites: Optional[int] = None  # satellites used in the solution (from NMEA GGA)
+    satellites: Optional[int] = None  # sats used in navigation (UBX-NAV-SAT svUsed, all constellations)
+    satellites_tracked: Optional[int] = None  # sats tracked (UBX-NAV-SAT numSvs)
     hdop: Optional[float] = None  # horizontal dilution of precision (from NMEA GGA)
     fix_quality: Optional[int] = None  # NMEA GGA quality (0=none, 1=GPS, 2=DGPS, ...)
     survey_in: Optional[Dict[str, Any]] = None  # {active, valid, duration_s, mean_acc_m, observations}
@@ -261,6 +262,7 @@ CFG_TMODE_FIXED_POS_ACC = 0x4003000F # U4: 0.1 mm
 CFG_TMODE_SVIN_MIN_DUR = 0x40030010  # U4: seconds
 CFG_TMODE_SVIN_ACC_LIMIT = 0x40030011  # U4: 0.1 mm units
 CFG_MSGOUT_UBX_NAV_SVIN_USB = 0x2091008B  # U1: output rate on USB
+CFG_MSGOUT_UBX_NAV_SAT_USB = 0x20910018   # U1: output rate of UBX-NAV-SAT on USB
 
 
 def ubx_frame(cls_id: int, msg_id: int, payload: bytes) -> bytes:
@@ -286,6 +288,11 @@ def ubx_valset(items, layers: int = 0x07) -> bytes:
     return ubx_frame(0x06, 0x8A, payload)
 
 
+def build_enable_nav_sat_valset(layers: int = 0x07) -> bytes:
+    """Enable periodic UBX-NAV-SAT output on USB (1 per navigation epoch)."""
+    return ubx_valset([(CFG_MSGOUT_UBX_NAV_SAT_USB, 1, 1)], layers)
+
+
 def build_survey_in_valset(min_duration: int, accuracy_m: float, layers: int = 0x07) -> bytes:
     """Configure survey-in mode and enable NAV-SVIN status output on USB."""
     acc_limit = max(1, int(round(accuracy_m * 10000)))  # metres -> 0.1 mm
@@ -294,6 +301,7 @@ def build_survey_in_valset(min_duration: int, accuracy_m: float, layers: int = 0
         (CFG_TMODE_SVIN_MIN_DUR, max(1, int(min_duration)), 4),
         (CFG_TMODE_SVIN_ACC_LIMIT, acc_limit, 4),
         (CFG_MSGOUT_UBX_NAV_SVIN_USB, 1, 1),
+        (CFG_MSGOUT_UBX_NAV_SAT_USB, 1, 1),
     ]
     return ubx_valset(items, layers)
 
@@ -333,8 +341,25 @@ def build_fixed_position_valset(
         (CFG_TMODE_HEIGHT_HP, height_hp, 1),
         (CFG_TMODE_FIXED_POS_ACC, acc, 4),
         (CFG_MSGOUT_UBX_NAV_SVIN_USB, 1, 1),
+        (CFG_MSGOUT_UBX_NAV_SAT_USB, 1, 1),
     ]
     return ubx_valset(items, layers)
+
+
+def decode_nav_sat(payload: bytes) -> Optional[Dict[str, int]]:
+    """Decode UBX-NAV-SAT: total tracked and count with svUsed flag set."""
+    if len(payload) < 8:
+        return None
+    num_svs = payload[5]
+    used = 0
+    for k in range(num_svs):
+        off = 8 + k * 12
+        if off + 12 > len(payload):
+            break
+        flags = int.from_bytes(payload[off + 8 : off + 12], "little")
+        if flags & 0x08:  # svUsed
+            used += 1
+    return {"tracked": num_svs, "used": used}
 
 
 class UBXScanner:
@@ -577,8 +602,13 @@ class RTKController(Controller):
         return self._status.model_dump()
 
     def _apply_ubx(self, cls_id: int, msg_id: int, payload: bytes) -> None:
-        """Update status from monitored UBX messages (NAV-SVIN, ACK/NAK)."""
-        if cls_id == 0x01 and msg_id == 0x3B and len(payload) >= 40:  # UBX-NAV-SVIN
+        """Update status from monitored UBX messages (NAV-SAT, NAV-SVIN, ACK/NAK)."""
+        if cls_id == 0x01 and msg_id == 0x35:  # UBX-NAV-SAT
+            decoded = decode_nav_sat(payload)
+            if decoded:
+                self._status.satellites = decoded["used"]
+                self._status.satellites_tracked = decoded["tracked"]
+        elif cls_id == 0x01 and msg_id == 0x3B and len(payload) >= 40:  # UBX-NAV-SVIN
             self._status.survey_in = {
                 "active": bool(payload[37]),
                 "valid": bool(payload[36]),
@@ -595,9 +625,7 @@ class RTKController(Controller):
                 )
 
     def _apply_nmea(self, update: Dict[str, Any]) -> None:
-        """Update sats / HDOP / fix quality / live position from a parsed NMEA sentence."""
-        if "satellites" in update:
-            self._status.satellites = update["satellites"]
+        """Update HDOP / fix quality / live position from NMEA (sats come from NAV-SAT)."""
         if "hdop" in update:
             self._status.hdop = update["hdop"]
         if "fix_quality" in update:
@@ -743,23 +771,33 @@ class RTKController(Controller):
         def _probe() -> Dict[str, Any]:
             parser = RTCMParser()
             nmea = NMEAScanner()
+            ubx = UBXScanner()
             counts: Dict[str, int] = {}
             base_pos = None
             total = 0
             satellites = None
+            satellites_tracked = None
             hdop = None
             fix_quality = None
             gps_position = None
             try:
                 with serial.Serial(device, data.serial_baud, timeout=1) as ser:
+                    try:
+                        ser.write(build_enable_nav_sat_valset())
+                    except Exception:  # noqa: BLE001
+                        pass
                     end = time.time() + 6
                     while time.time() < end:
                         chunk = ser.read(4096)
                         if not chunk:
                             continue
+                        for c, i, pl in ubx.add_data(chunk):
+                            if c == 0x01 and i == 0x35:
+                                decoded = decode_nav_sat(pl)
+                                if decoded:
+                                    satellites = decoded["used"]
+                                    satellites_tracked = decoded["tracked"]
                         for update in nmea.add_data(chunk):
-                            if "satellites" in update:
-                                satellites = update["satellites"]
                             if "hdop" in update:
                                 hdop = update["hdop"]
                             if "fix_quality" in update:
@@ -776,7 +814,9 @@ class RTKController(Controller):
                 return {"success": False, "message": f"Serial error: {e}", "device": device}
             extras = []
             if satellites is not None:
-                extras.append(f"{satellites} sats")
+                extras.append(f"{satellites} sats used in nav")
+                if satellites_tracked is not None:
+                    extras.append(f"{satellites_tracked} tracked")
             if hdop is not None:
                 extras.append(f"HDOP {hdop}")
             if gps_position is not None:
@@ -792,6 +832,7 @@ class RTKController(Controller):
                 "base_position": base_pos,
                 "gps_position": gps_position,
                 "satellites": satellites,
+                "satellites_tracked": satellites_tracked,
                 "hdop": hdop,
                 "fix_quality": fix_quality,
                 "message": (
@@ -902,6 +943,11 @@ class RTKController(Controller):
         self._serial = ser
         self._status.serial_connected = True
         print(f"Opened serial device {device} @ {cfg.serial_baud}")
+        # Ensure UBX-NAV-SAT is enabled so we can report sats used in navigation.
+        try:
+            await asyncio.to_thread(ser.write, build_enable_nav_sat_valset())
+        except Exception as e:  # noqa: BLE001
+            print(f"Warning: could not enable NAV-SAT output: {e}")
 
         reader = writer = None
         try:
