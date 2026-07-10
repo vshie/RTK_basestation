@@ -54,6 +54,13 @@ class RTKConfig(BaseModel):
     serial_device: str = DEFAULT_SERIAL_DEVICE
     serial_baud: int = 115200
     enabled: bool = False
+    # Persisted fixed-position lock (survives extension restarts). Only updated by
+    # Lock fixed position; cleared when survey-in is started.
+    fixed_locked: bool = False
+    fixed_lat: Optional[float] = None
+    fixed_lon: Optional[float] = None
+    fixed_height: Optional[float] = None  # metres, ellipsoidal
+    fixed_accuracy: float = 0.01
 
 
 class RTKStatus(BaseModel):
@@ -75,7 +82,9 @@ class RTKStatus(BaseModel):
     fix_quality: Optional[int] = None  # NMEA GGA quality (0=none, 1=GPS, 2=DGPS, ...)
     survey_in: Optional[Dict[str, Any]] = None  # {active, valid, duration_s, mean_acc_m, observations}
     survey_message: Optional[str] = None
-    tmode: Optional[str] = None  # disabled | survey-in | fixed (best-effort from last command)
+    tmode: Optional[str] = None  # disabled | survey-in | fixed
+    fixed_locked: bool = False
+    fixed_position: Optional[Dict[str, float]] = None  # locked {lat, lon, height, accuracy}
 
 
 class SurveyInRequest(BaseModel):
@@ -535,6 +544,43 @@ class RTKController(Controller):
         self._serial: Optional[serial.Serial] = None  # active handle while streaming
         self._ubx = UBXScanner()
         self._nmea = NMEAScanner()
+        self._sync_fixed_status_from_config()
+
+    def _sync_fixed_status_from_config(self) -> None:
+        """Mirror persisted fixed-lock fields into the live status object."""
+        cfg = self._config
+        self._status.fixed_locked = bool(cfg.fixed_locked)
+        if cfg.fixed_locked and cfg.fixed_lat is not None and cfg.fixed_lon is not None \
+                and cfg.fixed_height is not None:
+            self._status.fixed_position = {
+                "lat": cfg.fixed_lat,
+                "lon": cfg.fixed_lon,
+                "height": cfg.fixed_height,
+                "accuracy": cfg.fixed_accuracy,
+            }
+            self._status.tmode = "fixed"
+        elif not cfg.fixed_locked:
+            self._status.fixed_position = None
+            if self._status.tmode == "fixed":
+                self._status.tmode = None
+
+    def _clear_fixed_lock(self) -> None:
+        self._config.fixed_locked = False
+        self._config.fixed_lat = None
+        self._config.fixed_lon = None
+        self._config.fixed_height = None
+        self._config_manager.save_config(self._config)
+        self._status.fixed_locked = False
+        self._status.fixed_position = None
+
+    def _save_fixed_lock(self, lat: float, lon: float, height: float, accuracy: float) -> None:
+        self._config.fixed_locked = True
+        self._config.fixed_lat = lat
+        self._config.fixed_lon = lon
+        self._config.fixed_height = height
+        self._config.fixed_accuracy = accuracy
+        self._config_manager.save_config(self._config)
+        self._sync_fixed_status_from_config()
 
     # ---- validation -------------------------------------------------------- #
     def _validate(self, cfg: RTKConfig) -> List[str]:
@@ -582,8 +628,15 @@ class RTKController(Controller):
     @post("/config", sync_to_thread=False)
     def set_config(self, data: RTKConfig) -> Dict[str, Any]:
         errors = self._validate(data)
+        # NTRIP form must not wipe a previously locked fixed position.
+        data.fixed_locked = self._config.fixed_locked
+        data.fixed_lat = self._config.fixed_lat
+        data.fixed_lon = self._config.fixed_lon
+        data.fixed_height = self._config.fixed_height
+        data.fixed_accuracy = self._config.fixed_accuracy
         self._config = data
         self._config_manager.save_config(data)
+        self._sync_fixed_status_from_config()
 
         if data.enabled:
             if errors:
@@ -684,6 +737,8 @@ class RTKController(Controller):
         if not result.get("success"):
             return result
 
+        # Survey-in leaves fixed mode; clear the persisted lock so the UI matches.
+        self._clear_fixed_lock()
         self._status.tmode = "survey-in"
         acked = result.get("acked")
         if acked is True:
@@ -701,6 +756,7 @@ class RTKController(Controller):
             "message": msg,
             "device": device,
             "survey_in": self._status.survey_in,
+            "fixed_locked": False,
         }
 
     @post("/fixed_position")
@@ -741,24 +797,27 @@ class RTKController(Controller):
         if not result.get("success"):
             return result
 
-        self._status.tmode = "fixed"
-        self._status.survey_message = (
-            f"Fixed position locked from {source}: {lat:.7f}, {lon:.7f}, {height:.2f} m"
-        )
         acked = result.get("acked")
         if acked is False:
             return {"success": False, "message": "Receiver rejected fixed-position command (NAK).", "device": device}
+
+        self._save_fixed_lock(lat, lon, height, data.accuracy)
+        self._status.survey_message = (
+            f"Fixed position locked from {source}: {lat:.7f}, {lon:.7f}, {height:.2f} m"
+        )
         return {
             "success": True,
             "message": (
-                f"Fixed (stationary) mode set from {source}: "
+                f"Fixed (stationary) mode locked from {source}: "
                 f"{lat:.7f}, {lon:.7f}, alt {height:.2f} m "
-                f"(accuracy {data.accuracy} m)."
+                f"(accuracy {data.accuracy} m). Saved — will restore on restart."
             ),
             "device": device,
             "position": {"lat": lat, "lon": lon, "height": height},
             "source": source,
             "tmode": "fixed",
+            "fixed_locked": True,
+            "config": self._config.model_dump(),
         }
 
     @post("/test_serial")
@@ -948,6 +1007,26 @@ class RTKController(Controller):
             await asyncio.to_thread(ser.write, build_enable_nav_sat_valset())
         except Exception as e:  # noqa: BLE001
             print(f"Warning: could not enable NAV-SAT output: {e}")
+
+        # Re-apply a persisted fixed lock so the receiver matches saved coordinates.
+        if (
+            cfg.fixed_locked
+            and cfg.fixed_lat is not None
+            and cfg.fixed_lon is not None
+            and cfg.fixed_height is not None
+        ):
+            try:
+                cmd = build_fixed_position_valset(
+                    cfg.fixed_lat, cfg.fixed_lon, cfg.fixed_height, cfg.fixed_accuracy
+                )
+                await asyncio.to_thread(ser.write, cmd)
+                self._sync_fixed_status_from_config()
+                print(
+                    f"Re-applied fixed lock: {cfg.fixed_lat:.7f}, {cfg.fixed_lon:.7f}, "
+                    f"{cfg.fixed_height:.2f} m"
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"Warning: could not re-apply fixed position: {e}")
 
         reader = writer = None
         try:

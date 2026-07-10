@@ -81,6 +81,7 @@
                     <div>Satellites</div><div id="s-sats">Unknown</div>
                     <div>HDOP</div><div id="s-hdop">Unknown</div>
                     <div>Timing mode</div><div id="s-tmode">Unknown</div>
+                    <div>Fixed lock</div><div id="s-fixed">Not locked</div>
                     <div>Survey-in</div><div id="s-svin">Unknown</div>
                     <div>Last error</div><div id="s-error">None</div>
                 </div>
@@ -91,10 +92,12 @@
                 <p class="help-text" style="margin-top:0;">
                     For a stationary base, <strong>fixed mode</strong> is preferred: the receiver
                     treats its antenna as immobile and broadcasts a stable ARP in RTCM 1005.
-                    Survey-in estimates that position from a clear-sky average; once valid, lock it
-                    with &ldquo;Use surveyed position as fixed&rdquo;. You can also enter known
-                    coordinates manually.
+                    Locked coordinates are saved and restored after extension restarts.
+                    They only change when you click <strong>Lock fixed position</strong> again
+                    (with new values or blank to use ARP/GGA), or when you start a survey-in
+                    (which clears the lock).
                 </p>
+                <div id="fixed-lock-banner" class="msg" style="display:none; margin-bottom:12px;"></div>
                 <div class="grid">
                     <div class="form-group">
                         <label for="svin_dur">Survey-in min duration (seconds)</label>
@@ -105,16 +108,16 @@
                         <input id="svin_acc" type="number" value="2.0" min="0.1" step="0.1">
                     </div>
                     <div class="form-group">
-                        <label for="fix_lat">Fixed latitude (optional)</label>
-                        <input id="fix_lat" type="number" step="0.0000001" placeholder="from ARP / GGA if blank">
+                        <label for="fix_lat">Fixed latitude</label>
+                        <input id="fix_lat" type="number" step="0.0000001" placeholder="required to lock (or leave blank to use ARP/GGA)">
                     </div>
                     <div class="form-group">
-                        <label for="fix_lon">Fixed longitude (optional)</label>
-                        <input id="fix_lon" type="number" step="0.0000001" placeholder="from ARP / GGA if blank">
+                        <label for="fix_lon">Fixed longitude</label>
+                        <input id="fix_lon" type="number" step="0.0000001" placeholder="required to lock (or leave blank to use ARP/GGA)">
                     </div>
                     <div class="form-group">
-                        <label for="fix_height">Fixed height / altitude m (optional)</label>
-                        <input id="fix_height" type="number" step="0.01" placeholder="from ARP / GGA if blank">
+                        <label for="fix_height">Fixed height (ellipsoidal, m)</label>
+                        <input id="fix_height" type="number" step="0.01" placeholder="required to lock (or leave blank to use ARP/GGA)">
                     </div>
                     <div class="form-group">
                         <label for="fix_acc">Fixed position accuracy (metres)</label>
@@ -208,6 +211,13 @@
             };
         }
 
+        function fillFixedFields(cfg) {
+            if (cfg.fixed_lat != null) $('fix_lat').value = cfg.fixed_lat;
+            if (cfg.fixed_lon != null) $('fix_lon').value = cfg.fixed_lon;
+            if (cfg.fixed_height != null) $('fix_height').value = cfg.fixed_height;
+            if (cfg.fixed_accuracy != null) $('fix_acc').value = cfg.fixed_accuracy;
+        }
+
         function fill(cfg) {
             $('caster_host').value = cfg.caster_host ?? '';
             $('caster_port').value = cfg.caster_port ?? 2101;
@@ -218,6 +228,29 @@
             $('serial_device').value = cfg.serial_device ?? '';
             $('serial_baud').value = cfg.serial_baud ?? 115200;
             $('enabled').checked = cfg.enabled ?? false;
+            fillFixedFields(cfg);
+            updateFixedBanner(cfg.fixed_locked, cfg);
+        }
+
+        function updateFixedBanner(locked, pos) {
+            const banner = $('fixed-lock-banner');
+            if (locked && pos && pos.fixed_lat != null) {
+                banner.style.display = 'block';
+                banner.className = 'msg ok';
+                banner.textContent =
+                    `Fixed lock ACTIVE — ${Number(pos.fixed_lat).toFixed(7)}, ${Number(pos.fixed_lon).toFixed(7)}, ` +
+                    `h ${Number(pos.fixed_height).toFixed(2)} m (saved; restored on restart)`;
+            } else if (locked && pos && pos.lat != null) {
+                banner.style.display = 'block';
+                banner.className = 'msg ok';
+                banner.textContent =
+                    `Fixed lock ACTIVE — ${Number(pos.lat).toFixed(7)}, ${Number(pos.lon).toFixed(7)}, ` +
+                    `h ${Number(pos.height).toFixed(2)} m (saved; restored on restart)`;
+            } else {
+                banner.style.display = 'block';
+                banner.className = 'msg info';
+                banner.textContent = 'Fixed lock inactive — enter coordinates and click Lock fixed position, or start survey-in.';
+            }
         }
 
         function showMsg(text, kind) {
@@ -279,7 +312,17 @@
                 $('s-sats').textContent = 'Unknown';
             }
             $('s-hdop').textContent = (s.hdop != null) ? Number(s.hdop).toFixed(2) : 'Unknown';
-            $('s-tmode').textContent = s.tmode || (s.survey_in && s.survey_in.valid ? 'fixed/surveyed' : 'Unknown');
+            if (s.fixed_locked && s.fixed_position) {
+                const f = s.fixed_position;
+                $('s-tmode').textContent = 'fixed (locked)';
+                $('s-fixed').textContent =
+                    `${f.lat.toFixed(7)}, ${f.lon.toFixed(7)}, h ${f.height.toFixed(2)} m`;
+                updateFixedBanner(true, f);
+            } else {
+                $('s-tmode').textContent = s.tmode || (s.survey_in && s.survey_in.valid ? 'surveyed' : 'Unknown');
+                $('s-fixed').textContent = 'Not locked';
+                if (!s.fixed_locked) updateFixedBanner(false, null);
+            }
             if (s.survey_in) {
                 const v = s.survey_in;
                 const state = v.valid ? 'valid (complete)' : (v.active ? 'in progress' : 'inactive');
@@ -355,6 +398,13 @@
                 const d = await r.json();
                 el.className = 'msg ' + (d.success ? 'ok' : 'bad');
                 el.textContent = d.message;
+                if (d.success) {
+                    // Survey-in clears the lock — blank the fixed fields so they aren't stale.
+                    $('fix_lat').value = '';
+                    $('fix_lon').value = '';
+                    $('fix_height').value = '';
+                    updateFixedBanner(false, null);
+                }
             } catch (err) {
                 el.className = 'msg bad';
                 el.textContent = 'Survey-in request failed: ' + err;
@@ -386,6 +436,15 @@
                 const d = await r.json();
                 el.className = 'msg ' + (d.success ? 'ok' : 'bad');
                 el.textContent = d.message;
+                if (d.success && d.config) {
+                    fillFixedFields(d.config);
+                    updateFixedBanner(true, d.config);
+                } else if (d.success && d.position) {
+                    $('fix_lat').value = d.position.lat;
+                    $('fix_lon').value = d.position.lon;
+                    $('fix_height').value = d.position.height;
+                    updateFixedBanner(true, d.position);
+                }
             } catch (err) {
                 el.className = 'msg bad';
                 el.textContent = 'Fixed-position request failed: ' + err;
