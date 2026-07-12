@@ -61,6 +61,9 @@ class RTKConfig(BaseModel):
     fixed_lon: Optional[float] = None
     fixed_height: Optional[float] = None  # metres, ellipsoidal
     fixed_accuracy: float = 0.01
+    # Persisted survey-in setpoints (survive extension restarts / reinstalls).
+    survey_min_duration: int = 60  # seconds
+    survey_accuracy: float = 2.0   # metres
 
 
 class RTKStatus(BaseModel):
@@ -81,7 +84,7 @@ class RTKStatus(BaseModel):
     hdop: Optional[float] = None  # horizontal dilution of precision (from NMEA GGA)
     fix_quality: Optional[int] = None  # NMEA GGA quality (0=none, 1=GPS, 2=DGPS, ...)
     survey_in: Optional[Dict[str, Any]] = None  # {active, valid, duration_s, mean_acc_m, observations}
-    survey_target: Optional[Dict[str, Any]] = None  # {min_duration, accuracy} from last Start survey-in
+    survey_target: Optional[Dict[str, Any]] = None  # {min_duration, accuracy} active setpoint
     survey_history: List[Dict[str, float]] = []  # [{t, acc}] mean accuracy vs duration for UI chart
     survey_message: Optional[str] = None
     tmode: Optional[str] = None  # disabled | survey-in | fixed
@@ -90,6 +93,14 @@ class RTKStatus(BaseModel):
 
 
 class SurveyInRequest(BaseModel):
+    serial_device: str = DEFAULT_SERIAL_DEVICE
+    serial_baud: int = 115200
+    min_duration: int = 60  # seconds
+    accuracy: float = 2.0   # metres
+
+
+class SurveyTargetRequest(BaseModel):
+    """Update survey-in limits without (re)starting survey-in."""
     serial_device: str = DEFAULT_SERIAL_DEVICE
     serial_baud: int = 115200
     min_duration: int = 60  # seconds
@@ -313,6 +324,19 @@ def build_survey_in_valset(min_duration: int, accuracy_m: float, layers: int = 0
         (CFG_TMODE_SVIN_ACC_LIMIT, acc_limit, 4),
         (CFG_MSGOUT_UBX_NAV_SVIN_USB, 1, 1),
         (CFG_MSGOUT_UBX_NAV_SAT_USB, 1, 1),
+    ]
+    return ubx_valset(items, layers)
+
+
+def build_survey_limits_valset(min_duration: int, accuracy_m: float, layers: int = 0x07) -> bytes:
+    """Update survey-in duration/accuracy limits without touching TMODE_MODE.
+
+    Used to change the setpoint mid-survey without restarting the average.
+    """
+    acc_limit = max(1, int(round(accuracy_m * 10000)))  # metres -> 0.1 mm
+    items = [
+        (CFG_TMODE_SVIN_MIN_DUR, max(1, int(min_duration)), 4),
+        (CFG_TMODE_SVIN_ACC_LIMIT, acc_limit, 4),
     ]
     return ubx_valset(items, layers)
 
@@ -547,6 +571,7 @@ class RTKController(Controller):
         self._ubx = UBXScanner()
         self._nmea = NMEAScanner()
         self._sync_fixed_status_from_config()
+        self._sync_survey_target_from_config()
 
     def _sync_fixed_status_from_config(self) -> None:
         """Mirror persisted fixed-lock fields into the live status object."""
@@ -565,6 +590,20 @@ class RTKController(Controller):
             self._status.fixed_position = None
             if self._status.tmode == "fixed":
                 self._status.tmode = None
+
+    def _sync_survey_target_from_config(self) -> None:
+        """Mirror persisted survey-in setpoints into live status for the chart/ETA."""
+        cfg = self._config
+        self._status.survey_target = {
+            "min_duration": int(cfg.survey_min_duration),
+            "accuracy": float(cfg.survey_accuracy),
+        }
+
+    def _save_survey_target(self, min_duration: int, accuracy: float) -> None:
+        self._config.survey_min_duration = int(min_duration)
+        self._config.survey_accuracy = float(accuracy)
+        self._config_manager.save_config(self._config)
+        self._sync_survey_target_from_config()
 
     def _clear_fixed_lock(self) -> None:
         self._config.fixed_locked = False
@@ -630,15 +669,18 @@ class RTKController(Controller):
     @post("/config", sync_to_thread=False)
     def set_config(self, data: RTKConfig) -> Dict[str, Any]:
         errors = self._validate(data)
-        # NTRIP form must not wipe a previously locked fixed position.
+        # NTRIP form must not wipe a previously locked fixed position or survey setpoints.
         data.fixed_locked = self._config.fixed_locked
         data.fixed_lat = self._config.fixed_lat
         data.fixed_lon = self._config.fixed_lon
         data.fixed_height = self._config.fixed_height
         data.fixed_accuracy = self._config.fixed_accuracy
+        data.survey_min_duration = self._config.survey_min_duration
+        data.survey_accuracy = self._config.survey_accuracy
         self._config = data
         self._config_manager.save_config(data)
         self._sync_fixed_status_from_config()
+        self._sync_survey_target_from_config()
 
         if data.enabled:
             if errors:
@@ -749,10 +791,7 @@ class RTKController(Controller):
         self._status.survey_message = None
         self._status.survey_in = None
         self._status.survey_history = []
-        self._status.survey_target = {
-            "min_duration": int(data.min_duration),
-            "accuracy": float(data.accuracy),
-        }
+        self._save_survey_target(data.min_duration, data.accuracy)
         result = await self._send_ubx_command(cmd, device, data.serial_baud)
         if not result.get("success"):
             return result
@@ -776,7 +815,54 @@ class RTKController(Controller):
             "message": msg,
             "device": device,
             "survey_in": self._status.survey_in,
+            "survey_target": self._status.survey_target,
+            "config": self._config.model_dump(),
             "fixed_locked": False,
+        }
+
+    @post("/survey_target")
+    async def survey_target(self, data: SurveyTargetRequest) -> Dict[str, Any]:
+        """Change survey-in limits on the fly without restarting the survey average.
+
+        Updates CFG-TMODE-SVIN_MIN_DUR / SVIN_ACC_LIMIT only (does not set TMODE_MODE),
+        and persists the setpoint so it survives extension restarts.
+        """
+        device = find_serial_device(data.serial_device)
+        if not device:
+            return {"success": False, "message": f"Serial device not found: {data.serial_device}"}
+
+        if data.accuracy <= 0:
+            return {"success": False, "message": "Accuracy limit must be > 0 m"}
+        if data.min_duration < 1:
+            return {"success": False, "message": "Min duration must be >= 1 s"}
+
+        cmd = build_survey_limits_valset(data.min_duration, data.accuracy)
+        result = await self._send_ubx_command(cmd, device, data.serial_baud)
+        if not result.get("success"):
+            return result
+
+        self._save_survey_target(data.min_duration, data.accuracy)
+        acked = result.get("acked")
+        note = ""
+        svin = self._status.survey_in or {}
+        if svin.get("valid"):
+            note = (
+                " Survey-in already completed on the receiver; a tighter limit will not "
+                "resume averaging unless you Start survey-in again."
+            )
+        if acked is False:
+            return {"success": False, "message": "Receiver rejected the survey-target command (NAK).", "device": device}
+        msg = (
+            f"Survey target updated to min {data.min_duration}s, {data.accuracy} m "
+            f"(saved; applied without restarting survey-in).{note}"
+        )
+        return {
+            "success": True,
+            "message": msg,
+            "device": device,
+            "survey_target": self._status.survey_target,
+            "survey_in": self._status.survey_in,
+            "config": self._config.model_dump(),
         }
 
     @post("/fixed_position")

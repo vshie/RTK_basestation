@@ -112,17 +112,20 @@
                     Locked coordinates are saved and restored after extension restarts.
                     They only change when you click <strong>Lock fixed position</strong> again
                     (with new values or blank to use ARP/GGA), or when you start a survey-in
-                    (which clears the lock).
+                    (which clears the lock). Survey-in duration/accuracy setpoints are also
+                    saved; use <strong>Apply target</strong> to change them mid-survey without
+                    restarting the average.
                 </p>
                 <div id="fixed-lock-banner" class="msg" style="display:none; margin-bottom:12px;"></div>
                 <div class="grid">
                     <div class="form-group">
                         <label for="svin_dur">Survey-in min duration (seconds)</label>
-                        <input id="svin_dur" type="number" value="60" min="1">
+                        <input id="svin_dur" type="number" value="60" min="1" step="1">
                     </div>
                     <div class="form-group">
                         <label for="svin_acc">Survey-in accuracy limit (metres)</label>
-                        <input id="svin_acc" type="number" value="2.0" min="0.1" step="0.1">
+                        <input id="svin_acc" type="number" value="2.0" min="0.001" step="0.001">
+                        <div class="help-text">Saved across restarts. Apply target updates the receiver without restarting survey-in.</div>
                     </div>
                     <div class="form-group">
                         <label for="fix_lat">Fixed latitude</label>
@@ -143,6 +146,7 @@
                 </div>
                 <div class="btn-row">
                     <button type="button" id="btn-svin">Start survey-in</button>
+                    <button type="button" class="secondary" id="btn-svin-target">Apply target</button>
                     <button type="button" class="secondary" id="btn-fixed">Lock fixed position</button>
                 </div>
                 <div id="svin-msg" class="msg"></div>
@@ -264,7 +268,10 @@
             const acc = svin.mean_acc_m;
             const remMin = Math.max(0, (minDuration || 0) - duration);
 
-            if (svin.valid || (acc != null && acc <= targetAcc)) {
+            if (svin.valid) {
+                return { kind: 'done', seconds: 0, text: 'Survey-in complete' };
+            }
+            if (acc != null && acc <= targetAcc) {
                 if (remMin > 0) {
                     return {
                         kind: 'waiting_min',
@@ -272,7 +279,11 @@
                         text: `Accuracy met — waiting on min duration (${formatDuration(remMin)})`,
                     };
                 }
-                return { kind: 'done', seconds: 0, text: 'Survey-in complete' };
+                return {
+                    kind: 'waiting_min',
+                    seconds: null,
+                    text: 'Accuracy met — waiting for receiver to mark valid',
+                };
             }
 
             const pts = (history || []).filter(p => p.t != null && p.acc != null && p.acc > 0);
@@ -471,6 +482,11 @@
             };
         }
 
+        function fillSurveyFields(cfg) {
+            if (cfg.survey_min_duration != null) $('svin_dur').value = cfg.survey_min_duration;
+            if (cfg.survey_accuracy != null) $('svin_acc').value = cfg.survey_accuracy;
+        }
+
         function fillFixedFields(cfg) {
             if (cfg.fixed_lat != null) $('fix_lat').value = cfg.fixed_lat;
             if (cfg.fixed_lon != null) $('fix_lon').value = cfg.fixed_lon;
@@ -489,6 +505,7 @@
             $('serial_baud').value = cfg.serial_baud ?? 115200;
             $('enabled').checked = cfg.enabled ?? false;
             fillFixedFields(cfg);
+            fillSurveyFields(cfg);
             updateFixedBanner(cfg.fixed_locked, cfg);
         }
 
@@ -642,14 +659,18 @@
             } catch (err) { showMsg('Caster test failed: ' + err, 'bad'); }
         });
 
-        $('btn-svin').addEventListener('click', async () => {
+        function surveyBody() {
             const cfg = collect();
-            const body = {
+            return {
                 serial_device: cfg.serial_device,
                 serial_baud: cfg.serial_baud,
                 min_duration: parseInt($('svin_dur').value || '60', 10),
                 accuracy: parseFloat($('svin_acc').value || '2.0'),
             };
+        }
+
+        $('btn-svin').addEventListener('click', async () => {
+            const body = surveyBody();
             const el = $('svin-msg');
             el.className = 'msg info';
             el.textContent = 'Sending survey-in command to the receiver...';
@@ -668,12 +689,38 @@
                     $('fix_lon').value = '';
                     $('fix_height').value = '';
                     updateFixedBanner(false, null);
+                    if (d.config) fillSurveyFields(d.config);
                     scheduleStatusPoll(1000);
                     loadStatus();
                 }
             } catch (err) {
                 el.className = 'msg bad';
                 el.textContent = 'Survey-in request failed: ' + err;
+            }
+        });
+
+        $('btn-svin-target').addEventListener('click', async () => {
+            const body = surveyBody();
+            const el = $('svin-msg');
+            el.className = 'msg info';
+            el.textContent = 'Updating survey target on the receiver (without restarting)...';
+            try {
+                const r = await fetch('survey_target', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                const d = await r.json();
+                el.className = 'msg ' + (d.success ? 'ok' : 'bad');
+                el.textContent = d.message;
+                if (d.success) {
+                    if (d.config) fillSurveyFields(d.config);
+                    scheduleStatusPoll(1000);
+                    loadStatus();
+                }
+            } catch (err) {
+                el.className = 'msg bad';
+                el.textContent = 'Survey-target update failed: ' + err;
             }
         });
 
