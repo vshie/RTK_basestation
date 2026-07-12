@@ -81,6 +81,8 @@ class RTKStatus(BaseModel):
     hdop: Optional[float] = None  # horizontal dilution of precision (from NMEA GGA)
     fix_quality: Optional[int] = None  # NMEA GGA quality (0=none, 1=GPS, 2=DGPS, ...)
     survey_in: Optional[Dict[str, Any]] = None  # {active, valid, duration_s, mean_acc_m, observations}
+    survey_target: Optional[Dict[str, Any]] = None  # {min_duration, accuracy} from last Start survey-in
+    survey_history: List[Dict[str, float]] = []  # [{t, acc}] mean accuracy vs duration for UI chart
     survey_message: Optional[str] = None
     tmode: Optional[str] = None  # disabled | survey-in | fixed
     fixed_locked: bool = False
@@ -654,6 +656,16 @@ class RTKController(Controller):
     def get_status(self) -> Dict[str, Any]:
         return self._status.model_dump()
 
+    def _record_survey_sample(self, duration_s: int, mean_acc_m: float) -> None:
+        """Append a survey-in accuracy sample for the UI chart (deduped, capped)."""
+        hist = self._status.survey_history
+        if hist and hist[-1].get("t") == duration_s and hist[-1].get("acc") == mean_acc_m:
+            return
+        hist.append({"t": float(duration_s), "acc": float(mean_acc_m)})
+        # Keep enough points for a long survey (~1 Hz for ~30 min).
+        if len(hist) > 2000:
+            self._status.survey_history = hist[-2000:]
+
     def _apply_ubx(self, cls_id: int, msg_id: int, payload: bytes) -> None:
         """Update status from monitored UBX messages (NAV-SAT, NAV-SVIN, ACK/NAK)."""
         if cls_id == 0x01 and msg_id == 0x35:  # UBX-NAV-SAT
@@ -662,13 +674,16 @@ class RTKController(Controller):
                 self._status.satellites = decoded["used"]
                 self._status.satellites_tracked = decoded["tracked"]
         elif cls_id == 0x01 and msg_id == 0x3B and len(payload) >= 40:  # UBX-NAV-SVIN
+            duration_s = int.from_bytes(payload[8:12], "little")
+            mean_acc_m = round(int.from_bytes(payload[28:32], "little") / 10000.0, 4)
             self._status.survey_in = {
                 "active": bool(payload[37]),
                 "valid": bool(payload[36]),
-                "duration_s": int.from_bytes(payload[8:12], "little"),
-                "mean_acc_m": round(int.from_bytes(payload[28:32], "little") / 10000.0, 4),
+                "duration_s": duration_s,
+                "mean_acc_m": mean_acc_m,
                 "observations": int.from_bytes(payload[32:36], "little"),
             }
+            self._record_survey_sample(duration_s, mean_acc_m)
         elif cls_id == 0x05 and msg_id in (0x00, 0x01) and len(payload) >= 2:  # ACK/NAK
             if payload[0] == 0x06 and payload[1] == 0x8A:  # to a CFG-VALSET
                 self._status.survey_message = (
@@ -733,6 +748,11 @@ class RTKController(Controller):
         cmd = build_survey_in_valset(data.min_duration, data.accuracy)
         self._status.survey_message = None
         self._status.survey_in = None
+        self._status.survey_history = []
+        self._status.survey_target = {
+            "min_duration": int(data.min_duration),
+            "accuracy": float(data.accuracy),
+        }
         result = await self._send_ubx_command(cmd, device, data.serial_baud)
         if not result.get("success"):
             return result

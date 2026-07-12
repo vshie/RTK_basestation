@@ -50,6 +50,23 @@
         .msg.info { background: #e3f2fd; color: var(--brand2); display: block; }
         .tag { display: inline-block; background: #e8eaf6; color: #3949ab; border-radius: 4px;
                padding: 2px 8px; margin: 2px; font-size: 12px; font-family: ui-monospace, monospace; }
+        .svin-chart-wrap { display: none; margin-top: 16px; padding-top: 14px;
+                           border-top: 1px solid #e3e8ee; }
+        .svin-chart-wrap.on { display: block; }
+        .svin-chart-meta { display: flex; flex-wrap: wrap; gap: 10px 18px; margin-bottom: 10px;
+                           font-size: 13px; color: #455a64; }
+        .svin-chart-meta strong { color: #263238; font-weight: 650; }
+        .svin-chart-meta .eta { color: var(--brand2); }
+        .svin-chart-meta .eta.done { color: var(--ok); }
+        .svin-chart-meta .eta.warn { color: var(--warn); }
+        #svin-canvas { width: 100%; height: 220px; display: block; background: #fff;
+                       border: 1px solid #e3e8ee; border-radius: 6px; }
+        .svin-legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 8px;
+                       font-size: 12px; color: #607d8b; }
+        .svin-legend span::before { content: ''; display: inline-block; width: 14px; height: 3px;
+                                    margin-right: 6px; vertical-align: middle; border-radius: 1px; }
+        .svin-legend .acc::before { background: var(--brand); }
+        .svin-legend .target::before { background: var(--warn); }
         @media (max-width: 620px) { .grid { grid-template-columns: 1fr; } }
     </style>
 </head>
@@ -129,6 +146,19 @@
                     <button type="button" class="secondary" id="btn-fixed">Lock fixed position</button>
                 </div>
                 <div id="svin-msg" class="msg"></div>
+                <div id="svin-chart-wrap" class="svin-chart-wrap">
+                    <div class="svin-chart-meta">
+                        <span>Mean accuracy: <strong id="svin-acc-now">—</strong></span>
+                        <span>Target: <strong id="svin-acc-target">—</strong></span>
+                        <span>Duration: <strong id="svin-dur-now">—</strong></span>
+                        <span class="eta" id="svin-eta">ETA: —</span>
+                    </div>
+                    <canvas id="svin-canvas" width="800" height="220" aria-label="Survey-in accuracy chart"></canvas>
+                    <div class="svin-legend">
+                        <span class="acc">Mean accuracy</span>
+                        <span class="target">Accuracy limit</span>
+                    </div>
+                </div>
             </div>
 
             <div class="section">
@@ -196,6 +226,236 @@
 
     <script>
         const $ = (id) => document.getElementById(id);
+        let statusPollTimer = null;
+        let statusPollMs = 0;
+
+        function formatDuration(sec) {
+            if (sec == null || !Number.isFinite(sec)) return '—';
+            sec = Math.max(0, Math.round(sec));
+            if (sec < 60) return `${sec}s`;
+            const m = Math.floor(sec / 60);
+            const s = sec % 60;
+            if (m < 60) return s ? `${m}m ${s}s` : `${m}m`;
+            const h = Math.floor(m / 60);
+            const rm = m % 60;
+            return rm ? `${h}h ${rm}m` : `${h}h`;
+        }
+
+        function linearFit(points) {
+            // acc = slope * t + intercept
+            const n = points.length;
+            if (n < 2) return null;
+            let sumT = 0, sumA = 0, sumTT = 0, sumTA = 0;
+            for (const p of points) {
+                sumT += p.t;
+                sumA += p.acc;
+                sumTT += p.t * p.t;
+                sumTA += p.t * p.acc;
+            }
+            const den = n * sumTT - sumT * sumT;
+            if (Math.abs(den) < 1e-12) return null;
+            const slope = (n * sumTA - sumT * sumA) / den;
+            const intercept = (sumA - slope * sumT) / n;
+            return { slope, intercept };
+        }
+
+        function estimateSurveyEta(history, targetAcc, minDuration, svin) {
+            const duration = svin.duration_s || 0;
+            const acc = svin.mean_acc_m;
+            const remMin = Math.max(0, (minDuration || 0) - duration);
+
+            if (svin.valid || (acc != null && acc <= targetAcc)) {
+                if (remMin > 0) {
+                    return {
+                        kind: 'waiting_min',
+                        seconds: remMin,
+                        text: `Accuracy met — waiting on min duration (${formatDuration(remMin)})`,
+                    };
+                }
+                return { kind: 'done', seconds: 0, text: 'Survey-in complete' };
+            }
+
+            const pts = (history || []).filter(p => p.t != null && p.acc != null && p.acc > 0);
+            // Prefer recent window so the slope reflects current convergence rate.
+            const window = pts.slice(-Math.max(8, Math.min(90, pts.length)));
+            if (window.length < 4) {
+                return { kind: 'warming', seconds: null, text: 'Collecting samples for ETA…' };
+            }
+
+            const fit = linearFit(window);
+            if (!fit || !(fit.slope < -1e-6)) {
+                return {
+                    kind: 'not_converging',
+                    seconds: null,
+                    text: remMin > 0
+                        ? `Not converging yet · min duration ${formatDuration(remMin)} left`
+                        : 'Accuracy not improving — ETA unknown',
+                };
+            }
+
+            const tCross = (targetAcc - fit.intercept) / fit.slope;
+            const remAcc = Math.max(0, tCross - duration);
+            const rem = Math.max(remAcc, remMin);
+            if (!Number.isFinite(rem) || rem > 86400 * 7) {
+                return { kind: 'not_converging', seconds: null, text: 'ETA unknown (very slow convergence)' };
+            }
+            let text = `ETA ~${formatDuration(rem)}`;
+            if (remMin > remAcc + 1) text += ` (limited by min duration)`;
+            else if (remAcc > 1) text += ` to reach ${targetAcc} m`;
+            return { kind: 'estimate', seconds: rem, text };
+        }
+
+        function drawSurveyChart(history, targetAcc, svin) {
+            const canvas = $('svin-canvas');
+            const ctx = canvas.getContext('2d');
+            const dpr = window.devicePixelRatio || 1;
+            const cssW = canvas.clientWidth || 800;
+            const cssH = 220;
+            if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+                canvas.width = Math.round(cssW * dpr);
+                canvas.height = Math.round(cssH * dpr);
+            }
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, cssW, cssH);
+
+            const pad = { l: 52, r: 14, t: 14, b: 28 };
+            const plotW = cssW - pad.l - pad.r;
+            const plotH = cssH - pad.t - pad.b;
+            const pts = (history || []).filter(p => p.t != null && p.acc != null);
+
+            ctx.fillStyle = '#fafbfc';
+            ctx.fillRect(pad.l, pad.t, plotW, plotH);
+
+            if (!pts.length) {
+                ctx.fillStyle = '#90a4ae';
+                ctx.font = '13px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText('Waiting for survey-in samples…', pad.l + plotW / 2, pad.t + plotH / 2);
+                return;
+            }
+
+            const tMin = pts[0].t;
+            let tMax = Math.max(pts[pts.length - 1].t, tMin + 1);
+            // Keep some headroom past the current duration for readability.
+            tMax = Math.max(tMax, (svin && svin.duration_s) || 0);
+            let aMax = Math.max(targetAcc * 1.25, ...pts.map(p => p.acc));
+            const aMin = 0;
+            if (!(aMax > aMin)) aMax = targetAcc || 1;
+
+            const xOf = (t) => pad.l + ((t - tMin) / (tMax - tMin)) * plotW;
+            const yOf = (a) => pad.t + plotH - ((a - aMin) / (aMax - aMin)) * plotH;
+
+            // Grid + axes
+            ctx.strokeStyle = '#eceff1';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            for (let i = 0; i <= 4; i++) {
+                const y = pad.t + (plotH * i) / 4;
+                ctx.moveTo(pad.l, y);
+                ctx.lineTo(pad.l + plotW, y);
+            }
+            ctx.stroke();
+
+            ctx.fillStyle = '#78909c';
+            ctx.font = '11px ui-monospace, Menlo, monospace';
+            ctx.textAlign = 'right';
+            ctx.textBaseline = 'middle';
+            for (let i = 0; i <= 4; i++) {
+                const a = aMax - ((aMax - aMin) * i) / 4;
+                const y = pad.t + (plotH * i) / 4;
+                ctx.fillText(a >= 10 ? a.toFixed(1) : a.toFixed(2), pad.l - 6, y);
+            }
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'top';
+            ctx.fillText(`${Math.round(tMin)}s`, xOf(tMin), pad.t + plotH + 8);
+            ctx.fillText(`${Math.round(tMax)}s`, xOf(tMax), pad.t + plotH + 8);
+
+            // Target accuracy limit
+            if (targetAcc != null && Number.isFinite(targetAcc)) {
+                const y = yOf(targetAcc);
+                ctx.strokeStyle = '#ef6c00';
+                ctx.lineWidth = 1.5;
+                ctx.setLineDash([6, 4]);
+                ctx.beginPath();
+                ctx.moveTo(pad.l, y);
+                ctx.lineTo(pad.l + plotW, y);
+                ctx.stroke();
+                ctx.setLineDash([]);
+                ctx.fillStyle = '#ef6c00';
+                ctx.textAlign = 'left';
+                ctx.textBaseline = 'bottom';
+                ctx.font = '11px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
+                if (y > pad.t + 14) ctx.fillText(`limit ${targetAcc} m`, pad.l + 6, y - 3);
+                else {
+                    ctx.textBaseline = 'top';
+                    ctx.fillText(`limit ${targetAcc} m`, pad.l + 6, y + 3);
+                }
+            }
+
+            // Accuracy series
+            ctx.strokeStyle = '#1565c0';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            pts.forEach((p, i) => {
+                const x = xOf(p.t);
+                const y = yOf(p.acc);
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+
+            // Latest point
+            const last = pts[pts.length - 1];
+            ctx.fillStyle = '#1565c0';
+            ctx.beginPath();
+            ctx.arc(xOf(last.t), yOf(last.acc), 3.5, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        function updateSurveyChart(s) {
+            const wrap = $('svin-chart-wrap');
+            const svin = s.survey_in;
+            const hist = s.survey_history || [];
+            const target = s.survey_target || {};
+            const targetAcc = (target.accuracy != null)
+                ? Number(target.accuracy)
+                : parseFloat($('svin_acc').value || '2.0');
+            const minDur = (target.min_duration != null)
+                ? Number(target.min_duration)
+                : parseInt($('svin_dur').value || '60', 10);
+
+            const show = !!(svin && (svin.active || svin.valid || hist.length));
+            wrap.classList.toggle('on', show);
+            if (!show) return;
+
+            $('svin-acc-now').textContent = (svin && svin.mean_acc_m != null)
+                ? `${Number(svin.mean_acc_m).toFixed(4)} m`
+                : '—';
+            $('svin-acc-target').textContent = `${targetAcc} m`;
+            $('svin-dur-now').textContent = (svin && svin.duration_s != null)
+                ? formatDuration(svin.duration_s)
+                : '—';
+
+            const etaEl = $('svin-eta');
+            if (svin) {
+                const eta = estimateSurveyEta(hist, targetAcc, minDur, svin);
+                etaEl.textContent = eta.text;
+                etaEl.className = 'eta' + (eta.kind === 'done' ? ' done'
+                    : (eta.kind === 'not_converging' || eta.kind === 'warming' ? ' warn' : ''));
+            } else {
+                etaEl.textContent = 'ETA: —';
+                etaEl.className = 'eta';
+            }
+
+            drawSurveyChart(hist, targetAcc, svin || {});
+        }
+
+        function scheduleStatusPoll(ms) {
+            if (statusPollMs === ms && statusPollTimer) return;
+            statusPollMs = ms;
+            if (statusPollTimer) clearInterval(statusPollTimer);
+            statusPollTimer = setInterval(loadStatus, ms);
+        }
 
         function collect() {
             return {
@@ -332,6 +592,10 @@
                 $('s-svin').textContent = s.survey_message || 'Unknown';
             }
             $('s-error').textContent = s.last_error || 'None';
+            updateSurveyChart(s);
+            // Poll faster while survey-in is active so the chart stays responsive.
+            const active = s.survey_in && s.survey_in.active && !s.survey_in.valid;
+            scheduleStatusPoll(active ? 1000 : 3000);
         }
 
         $('cfg-form').addEventListener('submit', async (e) => {
@@ -404,6 +668,8 @@
                     $('fix_lon').value = '';
                     $('fix_height').value = '';
                     updateFixedBanner(false, null);
+                    scheduleStatusPoll(1000);
+                    loadStatus();
                 }
             } catch (err) {
                 el.className = 'msg bad';
@@ -453,7 +719,11 @@
 
         loadConfig();
         loadStatus();
-        setInterval(loadStatus, 3000);
+        scheduleStatusPoll(3000);
+        window.addEventListener('resize', () => {
+            // Redraw on resize using last status fetch via a lightweight re-poll.
+            loadStatus();
+        });
     </script>
 </body>
 </html>
