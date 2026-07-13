@@ -242,7 +242,10 @@
             if (m < 60) return s ? `${m}m ${s}s` : `${m}m`;
             const h = Math.floor(m / 60);
             const rm = m % 60;
-            return rm ? `${h}h ${rm}m` : `${h}h`;
+            if (h < 48) return rm ? `${h}h ${rm}m` : `${h}h`;
+            const d = Math.floor(h / 24);
+            const rh = h % 24;
+            return rh ? `${d}d ${rh}h` : `${d}d`;
         }
 
         function linearFit(points) {
@@ -294,7 +297,8 @@
             }
 
             const fit = linearFit(window);
-            if (!fit || !(fit.slope < -1e-6)) {
+            // Require improvement faster than ~1.2 mm/h (-3.33e-7 m/s).
+            if (!fit || !(fit.slope < -1e-6 / 3)) {
                 return {
                     kind: 'not_converging',
                     seconds: null,
@@ -307,8 +311,8 @@
             const tCross = (targetAcc - fit.intercept) / fit.slope;
             const remAcc = Math.max(0, tCross - duration);
             const rem = Math.max(remAcc, remMin);
-            if (!Number.isFinite(rem) || rem > 86400 * 7) {
-                return { kind: 'not_converging', seconds: null, text: 'ETA unknown (very slow convergence)' };
+            if (!Number.isFinite(rem) || rem < 0) {
+                return { kind: 'not_converging', seconds: null, text: 'ETA unknown' };
             }
             let text = `ETA ~${formatDuration(rem)}`;
             if (remMin > remAcc + 1) text += ` (limited by min duration)`;
