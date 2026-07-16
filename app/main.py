@@ -38,6 +38,14 @@ _global_config = {
     "config_file": "config/rtk_config.json",
 }
 
+# Caster uptime monitor tuning.
+UPTIME_SAMPLE_INTERVAL_S = 30       # how often the monitor records a timeline sample
+UPTIME_HISTORY_MAX = 2880           # ~24 h of samples at 30 s spacing (in-memory only)
+# Reachability probe targets. "Internet up" means we can reach Google; if that
+# succeeds but the caster does not, the caster counts as DOWN.
+INTERNET_PROBE_TARGETS = [("8.8.8.8", 53), ("8.8.4.4", 53)]  # Google DNS (TCP)
+PROBE_TIMEOUT_S = 4.0
+
 
 # --------------------------------------------------------------------------- #
 # Models
@@ -90,6 +98,10 @@ class RTKStatus(BaseModel):
     tmode: Optional[str] = None  # disabled | survey-in | fixed
     fixed_locked: bool = False
     fixed_position: Optional[Dict[str, float]] = None  # locked {lat, lon, height, accuracy}
+    # Caster uptime monitoring. "down" = internet reachable (Google) but caster unreachable.
+    caster_uptime: Optional[Dict[str, Any]] = None  # summary {monitoring_since, uptime_pct, ...}
+    caster_uptime_history: List[Dict[str, Any]] = []  # [{t, s}] s in up|down|noint (in-memory timeline)
+    caster_downtime_events: List[Dict[str, Any]] = []  # [{start, end, duration_s}] persisted outages
 
 
 class SurveyInRequest(BaseModel):
@@ -141,6 +153,50 @@ class ConfigManager:
             return True
         except Exception as e:  # noqa: BLE001
             print(f"Warning: could not save config to {self.config_file}: {e}")
+            return False
+
+
+class UptimeStore:
+    """Persist caster downtime events so 'last outage' survives restarts.
+
+    Only discrete outage events are written to disk (on open/close), not the
+    per-sample timeline, to avoid frequent writes on flash storage.
+    """
+
+    MAX_EVENTS = 300
+
+    def __init__(self, config_file: str = "config/rtk_config.json"):
+        # Store alongside the main config file.
+        self.path = Path(config_file).parent / "rtk_uptime.json"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def load(self) -> Dict[str, Any]:
+        try:
+            if self.path.exists():
+                with open(self.path, "r") as f:
+                    data = json.load(f)
+                    return {
+                        "monitoring_since": data.get("monitoring_since"),
+                        "events": list(data.get("events", []))[-self.MAX_EVENTS:],
+                    }
+        except Exception as e:  # noqa: BLE001
+            print(f"Warning: could not load uptime data from {self.path}: {e}")
+        return {"monitoring_since": None, "events": []}
+
+    def save(self, monitoring_since: Optional[str], events: List[Dict[str, Any]]) -> bool:
+        try:
+            with open(self.path, "w") as f:
+                json.dump(
+                    {
+                        "monitoring_since": monitoring_since,
+                        "events": events[-self.MAX_EVENTS:],
+                    },
+                    f,
+                    indent=2,
+                )
+            return True
+        except Exception as e:  # noqa: BLE001
+            print(f"Warning: could not save uptime data to {self.path}: {e}")
             return False
 
 
@@ -570,8 +626,22 @@ class RTKController(Controller):
         self._serial: Optional[serial.Serial] = None  # active handle while streaming
         self._ubx = UBXScanner()
         self._nmea = NMEAScanner()
+        # Caster uptime monitoring.
+        self._uptime_store = UptimeStore(_global_config["config_file"])
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._downtime_start: Optional[str] = None  # ISO start of the current open outage
+        _saved = self._uptime_store.load()
+        self._monitoring_since: Optional[str] = _saved.get("monitoring_since")
+        self._status.caster_downtime_events = _saved.get("events", [])
+        # Resume a dangling outage (process restarted mid-outage) so the first
+        # monitor tick can close it once the caster is reachable again.
+        for _ev in reversed(self._status.caster_downtime_events):
+            if _ev.get("end") is None and _ev.get("start"):
+                self._downtime_start = _ev["start"]
+                break
         self._sync_fixed_status_from_config()
         self._sync_survey_target_from_config()
+        self._recompute_uptime_summary()
 
     def _sync_fixed_status_from_config(self) -> None:
         """Mirror persisted fixed-lock fields into the live status object."""
@@ -652,6 +722,7 @@ class RTKController(Controller):
         if self._task and not self._task.done():
             self._task.cancel()
         self._task = asyncio.create_task(self._stream_loop())
+        self._start_monitor()
 
     def _stop_stream(self) -> None:
         if self._task and not self._task.done():
@@ -660,6 +731,195 @@ class RTKController(Controller):
         self._status.streaming = False
         self._status.caster_connected = False
         self._status.serial_connected = False
+        self._stop_monitor()
+
+    # ---- caster uptime monitor --------------------------------------------- #
+    def _start_monitor(self) -> None:
+        if self._monitor_task and not self._monitor_task.done():
+            return
+        if not self._monitoring_since:
+            self._monitoring_since = _now_iso()
+            self._persist_uptime()
+        self._monitor_task = asyncio.create_task(self._uptime_monitor_loop())
+
+    def _stop_monitor(self) -> None:
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+        self._monitor_task = None
+
+    async def _probe_tcp(self, host: str, port: int) -> bool:
+        """Return True if a TCP connection to host:port succeeds quickly."""
+        writer = None
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=PROBE_TIMEOUT_S
+            )
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    async def _internet_up(self) -> bool:
+        """True if we can reach Google (any probe target), i.e. the internet is up."""
+        for host, port in INTERNET_PROBE_TARGETS:
+            if await self._probe_tcp(host, port):
+                return True
+        return False
+
+    async def _caster_reachable(self) -> bool:
+        """True if the configured caster accepts a TCP connection."""
+        cfg = self._config
+        if not cfg.caster_host or not (0 < cfg.caster_port < 65536):
+            return False
+        return await self._probe_tcp(cfg.caster_host, cfg.caster_port)
+
+    async def _uptime_monitor_loop(self) -> None:
+        """Sample caster reachability on a fixed cadence and log outages.
+
+        An outage is only recorded when Google is reachable but the caster is
+        not — so a local internet drop is never blamed on RTK2Go.
+        """
+        while True:
+            try:
+                state = await self._classify_caster_state()
+                self._apply_uptime_state(state)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:  # noqa: BLE001
+                print(f"Uptime monitor error: {e}")
+            try:
+                await asyncio.sleep(UPTIME_SAMPLE_INTERVAL_S)
+            except asyncio.CancelledError:
+                return
+
+    async def _classify_caster_state(self) -> str:
+        """Return 'up', 'down', or 'noint' for the current moment."""
+        # Actively streaming with a live caster socket: definitively up, no probe needed.
+        if self._status.streaming and self._status.caster_connected:
+            return "up"
+        # Not streaming — decide whether the caster or our own internet is at fault.
+        if not await self._internet_up():
+            return "noint"
+        # Internet is up; the caster is only "down" if we cannot reach it either.
+        return "up" if await self._caster_reachable() else "down"
+
+    def _apply_uptime_state(self, state: str) -> None:
+        now = _now_iso()
+        self._record_uptime_sample(now, state)
+        if state == "down":
+            if self._downtime_start is None:
+                self._open_downtime(now)
+        else:
+            if self._downtime_start is not None:
+                self._close_downtime(now)
+        self._recompute_uptime_summary()
+
+    def _record_uptime_sample(self, t_iso: str, state: str) -> None:
+        hist = self._status.caster_uptime_history
+        hist.append({"t": t_iso, "s": state})
+        if len(hist) > UPTIME_HISTORY_MAX:
+            self._status.caster_uptime_history = hist[-UPTIME_HISTORY_MAX:]
+
+    def _open_downtime(self, t_iso: str) -> None:
+        self._downtime_start = t_iso
+        self._status.caster_downtime_events.append(
+            {"start": t_iso, "end": None, "duration_s": None}
+        )
+        self._status.caster_downtime_events = self._status.caster_downtime_events[
+            -UptimeStore.MAX_EVENTS:
+        ]
+        self._persist_uptime()
+        print(f"Caster DOWN detected at {t_iso} (Google reachable, caster not)")
+
+    def _close_downtime(self, t_iso: str) -> None:
+        start_iso = self._downtime_start
+        self._downtime_start = None
+        dur = self._duration_between(start_iso, t_iso)
+        events = self._status.caster_downtime_events
+        for ev in reversed(events):
+            if ev.get("start") == start_iso and ev.get("end") is None:
+                ev["end"] = t_iso
+                ev["duration_s"] = dur
+                break
+        self._persist_uptime()
+        print(f"Caster back UP at {t_iso} after {dur}s outage")
+
+    @staticmethod
+    def _duration_between(start_iso: Optional[str], end_iso: str) -> Optional[int]:
+        if not start_iso:
+            return None
+        try:
+            start = datetime.fromisoformat(start_iso)
+            end = datetime.fromisoformat(end_iso)
+            return max(0, int((end - start).total_seconds()))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _persist_uptime(self) -> None:
+        self._uptime_store.save(
+            self._monitoring_since, self._status.caster_downtime_events
+        )
+
+    def _recompute_uptime_summary(self) -> None:
+        """Derive the summary object the UI shows from events + samples."""
+        events = self._status.caster_downtime_events
+        now_iso = _now_iso()
+
+        total_down = 0
+        for ev in events:
+            if ev.get("duration_s") is not None:
+                total_down += int(ev["duration_s"])
+            elif ev.get("end") is None and ev.get("start"):
+                total_down += self._duration_between(ev["start"], now_iso) or 0
+
+        currently_down = self._downtime_start is not None
+        current_down_s = (
+            self._duration_between(self._downtime_start, now_iso)
+            if currently_down
+            else None
+        )
+
+        # Uptime % from the retained timeline (excluding no-internet samples).
+        hist = self._status.caster_uptime_history
+        counted = [h for h in hist if h.get("s") in ("up", "down")]
+        ups = sum(1 for h in counted if h.get("s") == "up")
+        uptime_pct = round(100.0 * ups / len(counted), 3) if counted else None
+
+        last_event = None
+        for ev in reversed(events):
+            if ev.get("start"):
+                last_event = {
+                    "start": ev.get("start"),
+                    "end": ev.get("end"),
+                    "duration_s": (
+                        ev.get("duration_s")
+                        if ev.get("duration_s") is not None
+                        else (
+                            self._duration_between(ev.get("start"), now_iso)
+                            if ev.get("end") is None
+                            else None
+                        )
+                    ),
+                    "ongoing": ev.get("end") is None,
+                }
+                break
+
+        self._status.caster_uptime = {
+            "monitoring_since": self._monitoring_since,
+            "uptime_pct": uptime_pct,
+            "total_downtime_s": total_down,
+            "outage_count": len(events),
+            "currently_down": currently_down,
+            "current_downtime_s": current_down_s,
+            "last_downtime": last_event,
+            "sample_interval_s": UPTIME_SAMPLE_INTERVAL_S,
+        }
 
     # ---- HTTP API ---------------------------------------------------------- #
     @get("/config", sync_to_thread=False)
@@ -696,6 +956,8 @@ class RTKController(Controller):
 
     @get("/status", sync_to_thread=False)
     def get_status(self) -> Dict[str, Any]:
+        # Refresh so an ongoing outage's duration ticks up between 30 s samples.
+        self._recompute_uptime_summary()
         return self._status.model_dump()
 
     def _record_survey_sample(self, duration_s: int, mean_acc_m: float) -> None:

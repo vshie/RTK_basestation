@@ -67,6 +67,23 @@
                                     margin-right: 6px; vertical-align: middle; border-radius: 1px; }
         .svin-legend .acc::before { background: var(--brand); }
         .svin-legend .target::before { background: var(--warn); }
+        .uptime-meta { display: flex; flex-wrap: wrap; gap: 10px 22px; margin-bottom: 12px;
+                       font-size: 13px; color: #455a64; }
+        .uptime-meta strong { color: #263238; font-weight: 650; }
+        .uptime-badge { display: inline-flex; align-items: center; gap: 7px; font-weight: 700;
+                        padding: 3px 10px; border-radius: 20px; font-size: 12px; }
+        .uptime-badge.up { background: #e8f5e9; color: var(--ok); }
+        .uptime-badge.down { background: #ffebee; color: var(--bad); }
+        .uptime-badge.idle { background: #eceff1; color: #607d8b; }
+        #uptime-canvas { width: 100%; height: 90px; display: block; background: #fff;
+                         border: 1px solid #e3e8ee; border-radius: 6px; }
+        .uptime-legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 8px;
+                         font-size: 12px; color: #607d8b; }
+        .uptime-legend span::before { content: ''; display: inline-block; width: 12px; height: 12px;
+                                      margin-right: 6px; vertical-align: middle; border-radius: 2px; }
+        .uptime-legend .up::before { background: var(--ok); }
+        .uptime-legend .down::before { background: var(--bad); }
+        .uptime-legend .noint::before { background: #b0bec5; }
         @media (max-width: 620px) { .grid { grid-template-columns: 1fr; } }
     </style>
 </head>
@@ -101,6 +118,32 @@
                     <div>Fixed lock</div><div id="s-fixed">Not locked</div>
                     <div>Survey-in</div><div id="s-svin">Unknown</div>
                     <div>Last error</div><div id="s-error">None</div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>Caster uptime</h2>
+                <p class="help-text" style="margin-top:0;">
+                    Tracks how reliably corrections reach the caster. An outage is only
+                    counted when Google is reachable but the caster is not — so a local
+                    internet drop is never blamed on RTK2Go. Sampled every 30&nbsp;s while
+                    streaming is enabled; outage history is saved across restarts.
+                </p>
+                <div class="uptime-meta">
+                    <span id="uptime-badge" class="uptime-badge idle">Monitor idle</span>
+                    <span>Uptime: <strong id="uptime-pct">—</strong></span>
+                    <span>Outages: <strong id="uptime-count">—</strong></span>
+                    <span>Total downtime: <strong id="uptime-total">—</strong></span>
+                    <span>Monitoring since: <strong id="uptime-since">—</strong></span>
+                </div>
+                <div id="uptime-last" class="msg info" style="margin-bottom:12px;">
+                    No caster outages recorded yet.
+                </div>
+                <canvas id="uptime-canvas" width="800" height="90" aria-label="Caster uptime timeline"></canvas>
+                <div class="uptime-legend">
+                    <span class="up">Caster reachable</span>
+                    <span class="down">Caster down (internet up)</span>
+                    <span class="noint">No internet</span>
                 </div>
             </div>
 
@@ -465,6 +508,121 @@
             drawSurveyChart(hist, targetAcc, svin || {});
         }
 
+        const UPTIME_COLORS = { up: '#2e7d32', down: '#c62828', noint: '#b0bec5' };
+
+        function fmtClock(iso) {
+            if (!iso) return '—';
+            const d = new Date(iso);
+            if (isNaN(d)) return iso;
+            return d.toLocaleString();
+        }
+
+        function drawUptimeChart(history, sampleIntervalS) {
+            const canvas = $('uptime-canvas');
+            const ctx = canvas.getContext('2d');
+            const dpr = window.devicePixelRatio || 1;
+            const cssW = canvas.clientWidth || 800;
+            const cssH = 90;
+            if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+                canvas.width = Math.round(cssW * dpr);
+                canvas.height = Math.round(cssH * dpr);
+            }
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, cssW, cssH);
+
+            const pad = { l: 8, r: 8, t: 10, b: 22 };
+            const plotW = cssW - pad.l - pad.r;
+            const barH = cssH - pad.t - pad.b;
+
+            ctx.fillStyle = '#fafbfc';
+            ctx.fillRect(pad.l, pad.t, plotW, barH);
+
+            const pts = (history || [])
+                .map(p => ({ t: new Date(p.t).getTime(), s: p.s }))
+                .filter(p => Number.isFinite(p.t))
+                .sort((a, b) => a.t - b.t);
+
+            if (!pts.length) {
+                ctx.fillStyle = '#90a4ae';
+                ctx.font = '13px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText('Waiting for uptime samples…', pad.l + plotW / 2, pad.t + barH / 2);
+                return;
+            }
+
+            const intervalMs = (sampleIntervalS || 30) * 1000;
+            const maxGap = intervalMs * 2.5;  // beyond this, treat as a monitoring gap
+            const tMin = pts[0].t;
+            const tMax = Math.max(pts[pts.length - 1].t, Date.now());
+            const span = Math.max(tMax - tMin, 1);
+            const xOf = (t) => pad.l + ((t - tMin) / span) * plotW;
+
+            for (let i = 0; i < pts.length; i++) {
+                const start = pts[i].t;
+                const nextT = (i + 1 < pts.length) ? pts[i + 1].t : tMax;
+                const gap = nextT - start;
+                const end = (gap > maxGap) ? start + intervalMs : nextT;
+                const x0 = xOf(start);
+                const x1 = Math.max(xOf(end), x0 + 1);
+                ctx.fillStyle = UPTIME_COLORS[pts[i].s] || '#b0bec5';
+                ctx.fillRect(x0, pad.t, x1 - x0, barH);
+            }
+
+            ctx.strokeStyle = '#e3e8ee';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(pad.l, pad.t, plotW, barH);
+
+            ctx.fillStyle = '#78909c';
+            ctx.font = '11px ui-monospace, Menlo, monospace';
+            ctx.textBaseline = 'top';
+            ctx.textAlign = 'left';
+            ctx.fillText(new Date(tMin).toLocaleTimeString(), pad.l, pad.t + barH + 6);
+            ctx.textAlign = 'right';
+            ctx.fillText(new Date(tMax).toLocaleTimeString(), pad.l + plotW, pad.t + barH + 6);
+        }
+
+        function updateUptimeSection(s) {
+            const u = s.caster_uptime || {};
+            const badge = $('uptime-badge');
+            if (!s.streaming && !u.currently_down && !(s.caster_uptime_history || []).length) {
+                badge.className = 'uptime-badge idle';
+                badge.textContent = 'Monitor idle';
+            } else if (u.currently_down) {
+                badge.className = 'uptime-badge down';
+                const d = u.current_downtime_s != null ? ` · ${formatDuration(u.current_downtime_s)}` : '';
+                badge.textContent = `Caster DOWN${d}`;
+            } else {
+                badge.className = 'uptime-badge up';
+                badge.textContent = 'Caster reachable';
+            }
+
+            $('uptime-pct').textContent = (u.uptime_pct != null) ? `${u.uptime_pct}%` : '—';
+            $('uptime-count').textContent = (u.outage_count != null) ? u.outage_count : '—';
+            $('uptime-total').textContent = (u.total_downtime_s != null)
+                ? formatDuration(u.total_downtime_s) : '—';
+            $('uptime-since').textContent = fmtClock(u.monitoring_since);
+
+            const lastEl = $('uptime-last');
+            const last = u.last_downtime;
+            if (u.currently_down && last) {
+                lastEl.className = 'msg bad';
+                lastEl.textContent =
+                    `Caster DOWN since ${fmtClock(last.start)}` +
+                    (u.current_downtime_s != null ? ` (${formatDuration(u.current_downtime_s)} and counting)` : '');
+            } else if (last) {
+                lastEl.className = 'msg info';
+                const dur = (last.duration_s != null) ? formatDuration(last.duration_s) : 'unknown duration';
+                lastEl.textContent =
+                    `Last outage: ${fmtClock(last.start)} → ${fmtClock(last.end)} · lasted ${dur}`;
+            } else {
+                lastEl.className = 'msg info';
+                lastEl.textContent = 'No caster outages recorded yet.';
+            }
+
+            drawUptimeChart(s.caster_uptime_history, u.sample_interval_s);
+        }
+
         function scheduleStatusPoll(ms) {
             if (statusPollMs === ms && statusPollTimer) return;
             statusPollMs = ms;
@@ -614,6 +772,7 @@
             }
             $('s-error').textContent = s.last_error || 'None';
             updateSurveyChart(s);
+            updateUptimeSection(s);
             // Poll faster while survey-in is active so the chart stays responsive.
             const active = s.survey_in && s.survey_in.active && !s.survey_in.valid;
             scheduleStatusPoll(active ? 1000 : 3000);
