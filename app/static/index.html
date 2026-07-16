@@ -482,7 +482,7 @@
                 ? Number(target.min_duration)
                 : parseInt($('svin_dur').value || '60', 10);
 
-            const show = !!(svin && (svin.active || svin.valid || hist.length));
+            const show = !!(svin && svin.active && !svin.valid);
             wrap.classList.toggle('on', show);
             if (!show) return;
 
